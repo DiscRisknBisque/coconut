@@ -5,18 +5,23 @@ The code base is the official implementation of [Training Large Language Models 
 ![coconut](assets/coconut.png)
 
 ## Getting Started
+
 Clone repo:
+
 ```
 git clone git@github.com:facebookresearch/coconut.git
 cd coconut
 ```
 
 Setup environment:
+
 ```
 conda create --name coconut python=3.12
 conda activate coconut
 pip install -r requirements.txt
 ```
+
+> **Note:** PyTorch Geometric wheels are version-specific. If the installation above fails, grab the matching CUDA/CPU wheels from the [official guide](https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html#installation-via-pip) before re-running the `pip install -r requirements.txt` step.
 
 The code relies on [wandb](https://wandb.ai/site/) for logging. Please log in your wandb account following this [document](https://docs.wandb.ai/ref/cli/wandb-login/) before running any experiments.
 
@@ -43,6 +48,50 @@ For example, you can download and process the [GSM8K](https://arxiv.org/abs/2110
 bash preprocessing/gsm_icot.bash
 ```
 
+## Graph Conditioning
+
+To enable the GNN-based graph conditioning, construct lexical subgraph sidecars for each dataset split. The scripts will hash sentence features, build lexical-overlap edges, and emit manifest files that Coconut loads at runtime.
+
+### ProntoQA subgraphs
+
+```bash
+python preprocessing/graphify_prontoqa.py \
+  --input data/prontoqa_train.json \
+  --split train \
+  --output data/prontoqa_graphs/train
+
+python preprocessing/graphify_prontoqa.py \
+  --input data/prontoqa_valid.json \
+  --split valid \
+  --output data/prontoqa_graphs/valid
+
+python preprocessing/graphify_prontoqa.py \
+  --input data/prontoqa_test.json \
+  --split test \
+  --output data/prontoqa_graphs/test
+```
+
+### ProsQA subgraphs
+
+```bash
+python preprocessing/graphify_prosqa.py \
+  --input data/prosqa_train.json \
+  --split train \
+  --output data/prosqa_graphs/train
+
+python preprocessing/graphify_prosqa.py \
+  --input data/prosqa_valid.json \
+  --split valid \
+  --output data/prosqa_graphs/valid
+
+python preprocessing/graphify_prosqa.py \
+  --input data/prosqa_test.json \
+  --split test \
+  --output data/prosqa_graphs/test
+```
+
+Each command writes per-example tensors to `*.pt` files and a `manifest_<split>.json` file inside the target directory. Ensure `graph_sidecar_root` in your YAML configuration points at the parent directory (for example, `data/prontoqa_graphs`).
+
 ## Arguments
 
 The configuration of a run should be specified in a yaml file (an example can be found [here](args/gsm_coconut.yaml)).
@@ -54,6 +103,7 @@ The configuration of a run should be specified in a yaml file (an example can be
   - **only_eval**: If true, only load a model and test on the data from `val_path` (must used along with `load_model_path`). Otherwise, train the model on `train_path` and test on `val_path` after every epoch.
 
 - **Method**
+
   - **coconut**: Train coconut model
   - **cot**: Train cot model
   - **no_thoughts**: Train coconut (w/o thought) model
@@ -82,7 +132,6 @@ The configuration of a run should be specified in a yaml file (an example can be
   - **lr**: Learning rate
   - **weight_decay**: Weight decay
 
-
 ## Training
 
 Run the following commands (replacing `N_GPUS` and `PATH_TO_ARGS`):
@@ -95,8 +144,7 @@ torchrun --nnodes 1 --nproc_per_node N_GPUS run.py PATH_TO_ARGS
 
 Here we provide instructions to reproduce our experiments in the paper.
 
-All the commands below assume 4 * A100 (80GB) GPUs. You may change the corresponding arguments in the config file (`batch_size_training`, `gradient_accumulation_steps`) and `nproc_per_node` when launching the run, to adapt your resources.
-
+All the commands below assume 4 \* A100 (80GB) GPUs. You may change the corresponding arguments in the config file (`batch_size_training`, `gradient_accumulation_steps`) and `nproc_per_node` when launching the run, to adapt your resources.
 
 ### GSM8K
 
@@ -139,39 +187,50 @@ Then copy the generated `5hop_0shot_random.json` file to `data` directory, and p
 python preprocessing/prontoqa.py
 ```
 
-
 Then run the following to train the model:
+
 ```bash
 torchrun --nnodes 1 --nproc_per_node 4 run.py args/prontoqa_coconut.yaml
 ```
 
+To enable graph conditioning, point to the cached subgraphs via the GNN configuration:
+
+```bash
+torchrun --nnodes 1 --nproc_per_node 4 run.py args/prontoqa_coconut_gnn.yaml
+```
+
 Find the checkpoint with best validation accuracy, and put the path as `load_model_path` in [args/prosqa_coconut_eval.yaml](args/prosqa_coconut_eval.yaml). To evaluate:
 
 ```bash
 torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_coconut_eval.yaml
 ```
 
-
 ### ProsQA
 
-The ProsQA dataset is at [data/prosqa_*.json](data).
+The ProsQA dataset is at [data/prosqa\_\*.json](data).
 
 Then run the following to train the model:
+
 ```bash
 torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_coconut.yaml
 ```
 
+Run the GNN-enhanced variant with:
+
+```bash
+torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_coconut_gnn.yaml
+```
+
 Find the checkpoint with best validation accuracy, and put the path as `load_model_path` in [args/prosqa_coconut_eval.yaml](args/prosqa_coconut_eval.yaml). To evaluate:
 
 ```bash
 torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_coconut_eval.yaml
 ```
 
-
-
-
 ## Citation
+
 If you use this code base in your research, please cite our paper with the following BibTex entry:
+
 ```bibtex
 @article{hao2024training,
   title={Training Large Language Models to Reason in a Continuous Latent Space},
@@ -182,4 +241,5 @@ If you use this code base in your research, please cite our paper with the follo
 ```
 
 ## License
+
 This code is released under the MIT license (see [LICENSE](LICENSE)).

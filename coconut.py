@@ -3,11 +3,19 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 from collections import namedtuple
+from typing import Optional
+
 from transformers.models.gpt2 import GPT2LMHeadModel
 
-Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
+from graph_encoder import GraphPrefixAdapter, GraphProjector, build_graph_encoder
+
+Outputs = namedtuple(
+    "Outputs",
+    ["loss", "inputs_embeds", "logits", "align_loss", "graph_embedding"],
+)
 MAX_N_LATENT = 8
 
 
@@ -20,6 +28,8 @@ class Coconut(nn.Module):
         start_latent_id,
         end_latent_id,
         eos_token_id,
+        pad_token_id,
+        graph_config: Optional[dict] = None,
     ):
 
         super(Coconut, self).__init__()
@@ -29,6 +39,13 @@ class Coconut(nn.Module):
         self.eos_token_id = eos_token_id
         self.start_latent_id = start_latent_id
         self.end_latent_id = end_latent_id
+        self.pad_token_id = pad_token_id
+        self.label_pad_token_id = -100
+        self.use_graph = False
+        self.graph_prefix_len = 0
+        self.align_loss_weight = 0.0
+        self.latent_injection = "none"
+        self.graph_dim = None
 
         # tested with GPT2 and Llama3
         if isinstance(self.base_causallm, GPT2LMHeadModel):
@@ -36,7 +53,111 @@ class Coconut(nn.Module):
         else:
             self.embedding = self.base_causallm.get_input_embeddings()
 
-    def forward(self, input_ids, attention_mask, labels, position_ids, **kwargs):
+        if graph_config and graph_config.get("use_graph", False):
+            self._init_graph_modules(graph_config)
+
+    def _init_graph_modules(self, graph_config: dict):
+        hidden_size = self.embedding.embedding_dim
+        graph_dim = graph_config.get("graph_dim", 256)
+        graph_input_dim = graph_config.get(
+            "graph_input_dim", graph_config.get("graph_feature_dim", 259)
+        )
+        graph_hidden_dim = graph_config.get("graph_hidden_dim", graph_dim)
+        graph_encoder_name = graph_config.get("graph_encoder", "gcn2")
+        prefix_len = graph_config.get("graph_prefix_len", 4)
+        projector_hidden = graph_config.get("graph_projector_hidden", graph_dim)
+        dropout = graph_config.get("graph_dropout", 0.1)
+        projector_dropout = graph_config.get("graph_projector_dropout", dropout)
+        prefix_dropout = graph_config.get("graph_prefix_dropout", dropout)
+
+        self.graph_encoder = build_graph_encoder(
+            graph_encoder_name,
+            d_in=graph_input_dim,
+            d_hidden=graph_hidden_dim,
+            d_out=graph_dim,
+            dropout=dropout,
+        )
+        self.graph_projector = GraphProjector(
+            d_in=graph_dim,
+            d_hidden=projector_hidden,
+            d_out=hidden_size,
+            dropout=projector_dropout,
+        )
+        self.graph_prefix_adapter = GraphPrefixAdapter(
+            hidden_size=hidden_size,
+            prefix_len=prefix_len,
+            dropout=prefix_dropout,
+        )
+        self.graph_residual_norm = nn.LayerNorm(hidden_size)
+
+        self.use_graph = True
+        self.graph_prefix_len = prefix_len
+        self.graph_dim = graph_dim
+        self.align_loss_weight = graph_config.get("align_loss_weight", 0.0)
+        self.latent_injection = graph_config.get("latent_injection", "residual")
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        labels,
+        position_ids,
+        graph_x=None,
+        graph_edge_index=None,
+        graph_batch=None,
+        graph_role=None,
+        **kwargs,
+    ):
+
+        if self.use_graph:
+            if graph_x is None or graph_edge_index is None or graph_batch is None:
+                raise ValueError(
+                    "Graph conditioning requested but graph inputs are missing."
+                )
+            z_g, _ = self.graph_encoder(graph_x, graph_edge_index, graph_batch)
+            graph_embedding = self.graph_projector(z_g)
+            graph_prefix = (
+                self.graph_prefix_adapter(graph_embedding)
+                if self.graph_prefix_len > 0
+                else None
+            )
+            graph_residual = self.graph_residual_norm(graph_embedding)
+        else:
+            graph_embedding = None
+            graph_prefix = None
+            graph_residual = None
+
+        batch_size = input_ids.shape[0]
+        inputs_embeds = self.embedding(input_ids)
+
+        if graph_prefix is not None:
+            inputs_embeds = torch.cat([graph_prefix, inputs_embeds], dim=1)
+            prefix_mask = torch.ones(
+                (batch_size, self.graph_prefix_len),
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+            attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
+            prefix_positions = torch.arange(
+                self.graph_prefix_len, device=position_ids.device
+            ).unsqueeze(0)
+            prefix_positions = prefix_positions.expand(batch_size, -1)
+            position_ids = torch.cat([prefix_positions, position_ids + self.graph_prefix_len], dim=1)
+            if labels is not None:
+                prefix_labels = torch.full(
+                    (batch_size, self.graph_prefix_len),
+                    self.label_pad_token_id,
+                    dtype=labels.dtype,
+                    device=labels.device,
+                )
+                labels = torch.cat([prefix_labels, labels], dim=1)
+            pad_prefix = torch.full(
+                (batch_size, self.graph_prefix_len),
+                self.pad_token_id,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            input_ids = torch.cat([pad_prefix, input_ids], dim=1)
 
         logits = []
 
@@ -52,7 +173,6 @@ class Coconut(nn.Module):
         max_n_latents = max([len(l) for l in latent_lists])
 
         next_compute_range = (0, input_ids.shape[1])
-        inputs_embeds = self.embedding(input_ids)
 
         if max_n_latents > 0:
             next_compute_range = (0, latent_indices[:, 1].min().item())
@@ -62,8 +182,7 @@ class Coconut(nn.Module):
 
         for pass_idx in range(max_n_latents):
 
-            if kv_cache == None:
-                # first forward pass
+            if kv_cache is None:
                 outputs = self.base_causallm(
                     inputs_embeds=inputs_embeds[
                         :, next_compute_range[0] : next_compute_range[1], :
@@ -79,7 +198,6 @@ class Coconut(nn.Module):
                 hidden_states_offset = 0
 
             else:
-                # extract kv cache to reuse
                 past_key_values = [
                     (
                         k[:, :, : next_compute_range[0], :],
@@ -101,9 +219,6 @@ class Coconut(nn.Module):
                 )
 
                 hidden_states_offset = next_compute_range[0]
-                # when we use kv_cache for the first k tokens
-                # in `outputs.hidden_states`, [0, k) will be skipped
-                # so we need to keep this offset to correctly use the last hidden states
 
             logits.append(outputs.logits)
 
@@ -116,22 +231,15 @@ class Coconut(nn.Module):
                 ),
             )
 
-            hidden_states = outputs.hidden_states[
-                -1
-            ]  # Get the last layer hidden states
+            hidden_states = outputs.hidden_states[-1]
             kv_cache = outputs.past_key_values
 
-            # feedback the continuous thoughts to the input_embeds
-
-            # first decide the positions to feedback
             filling_indices = [
                 (instance_idx, mask_list[pass_idx])
                 for instance_idx, mask_list in enumerate(latent_lists)
                 if len(mask_list) > pass_idx
             ]
 
-            # to avoid in-place operations
-            # break down inputs_embeds (bs, len, hidden_size) into a list of list of 1-d tensors
             tensor_list = [
                 [
                     inputs_embeds[batch_idx, pos, :]
@@ -140,16 +248,20 @@ class Coconut(nn.Module):
                 for batch_idx in range(inputs_embeds.shape[0])
             ]
 
-            # replace some of them with continuous thoughts
             for idx_pair in filling_indices:
                 batch_idx, token_idx = idx_pair
-
-                # replace it with the preceding last hidden states
-                tensor_list[batch_idx][token_idx] = hidden_states[
+                new_state = hidden_states[
                     batch_idx, token_idx - 1 - hidden_states_offset, :
                 ]
+                if (
+                    graph_residual is not None
+                    and self.latent_injection == "residual"
+                    and pass_idx == 0
+                ):
+                    new_state = new_state + graph_residual[batch_idx]
 
-            # assemble the new inputs_embeds
+                tensor_list[batch_idx][token_idx] = new_state
+
             inputs_embeds = torch.stack(
                 [
                     torch.stack(tensor_list[batch_idx])
@@ -157,7 +269,6 @@ class Coconut(nn.Module):
                 ]
             )
 
-        # final pass
         outputs = self.base_causallm(
             inputs_embeds=inputs_embeds[
                 :, next_compute_range[0] : next_compute_range[1], :
@@ -180,6 +291,15 @@ class Coconut(nn.Module):
 
         logits.append(outputs.logits)
 
+        if graph_embedding is not None and self.align_loss_weight > 0:
+            pre_decode_hidden = outputs.hidden_states[-1][:, -1, :]
+            norm_proj = F.normalize(graph_embedding, dim=-1)
+            norm_hidden = F.normalize(pre_decode_hidden, dim=-1)
+            align_loss = 1 - F.cosine_similarity(norm_proj, norm_hidden, dim=-1)
+            align_loss = align_loss.mean()
+        else:
+            align_loss = None
+
         self.gen_forward_cnt += max_n_latents + 1
 
         logits = torch.cat(logits, dim=-2)
@@ -190,7 +310,16 @@ class Coconut(nn.Module):
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
         )
 
-        return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
+        if align_loss is not None:
+            loss = loss + self.align_loss_weight * align_loss
+
+        return Outputs(
+            loss=loss,
+            inputs_embeds=inputs_embeds,
+            logits=logits,
+            align_loss=align_loss,
+            graph_embedding=graph_embedding,
+        )
 
     def train(self):
         self.base_causallm.train()
@@ -205,12 +334,21 @@ class Coconut(nn.Module):
         max_new_tokens=16,
         output_embedding=False,
         synced_gpus=False,
+        graph_x=None,
+        graph_edge_index=None,
+        graph_batch=None,
+        graph_role=None,
         **kwargs
     ):
 
         self.gen_forward_cnt = 0
 
         assert input_ids.shape[0] == 1, "only support batch_size == 1 now"
+
+        if self.use_graph and (graph_x is None or graph_edge_index is None or graph_batch is None):
+            raise ValueError(
+                "Graph conditioning requires graph inputs during generation."
+            )
 
         tokens = input_ids[0].detach().tolist()
 
@@ -222,6 +360,10 @@ class Coconut(nn.Module):
             torch.arange(
                 0, input_ids.shape[1], dtype=torch.long, device=input_ids.device
             ).reshape(1, -1),
+            graph_x=graph_x,
+            graph_edge_index=graph_edge_index,
+            graph_batch=graph_batch,
+            graph_role=graph_role,
         )
         inputs_embeds = outputs.inputs_embeds
 

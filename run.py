@@ -58,6 +58,32 @@ def main():
 
     configs = Config(config_dict)
     set_seed(configs.seed)
+
+    default_graph_config = {
+        "use_graph": False,
+        "graph_encoder": "gcn2",
+        "graph_dim": 256,
+        "graph_prefix_len": 4,
+        "align_loss_weight": 0.0,
+        "latent_injection": "residual",
+        "graph_sidecar_root": None,
+        "graph_dropout": 0.1,
+        "graph_projector_hidden": None,
+        "graph_projector_dropout": None,
+        "graph_prefix_dropout": None,
+        "graph_hidden_dim": None,
+        "graph_input_dim": 259,
+    }
+
+    for key, value in default_graph_config.items():
+        if not hasattr(configs, key):
+            setattr(configs, key, value)
+
+    if configs.use_graph and not configs.graph_sidecar_root:
+        raise ValueError(
+            "Graph conditioning enabled but 'graph_sidecar_root' is not configured."
+        )
+
     save_dir = os.path.join(configs.save_path, configs.name)
 
     if not os.path.exists(save_dir) and rank == 0:
@@ -110,6 +136,37 @@ def main():
     start_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
     end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
 
+    graph_config = {
+        "use_graph": configs.use_graph,
+        "graph_encoder": configs.graph_encoder,
+        "graph_dim": configs.graph_dim,
+        "graph_prefix_len": configs.graph_prefix_len,
+        "align_loss_weight": configs.align_loss_weight,
+        "latent_injection": configs.latent_injection,
+        "graph_dropout": configs.graph_dropout,
+        "graph_projector_hidden": (
+            configs.graph_projector_hidden
+            if configs.graph_projector_hidden is not None
+            else configs.graph_dim
+        ),
+        "graph_projector_dropout": (
+            configs.graph_projector_dropout
+            if configs.graph_projector_dropout is not None
+            else configs.graph_dropout
+        ),
+        "graph_prefix_dropout": (
+            configs.graph_prefix_dropout
+            if configs.graph_prefix_dropout is not None
+            else configs.graph_dropout
+        ),
+        "graph_hidden_dim": (
+            configs.graph_hidden_dim
+            if configs.graph_hidden_dim is not None
+            else configs.graph_dim
+        ),
+        "graph_input_dim": configs.graph_input_dim,
+    }
+
     loaded = False
 
     if configs.load_model_path != "None":
@@ -161,7 +218,15 @@ def main():
         configs.coconut = False
 
     if configs.coconut:
-        model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id)
+        model = Coconut(
+            model,
+            latent_id,
+            start_id,
+            end_id,
+            tokenizer.eos_token_id,
+            tokenizer.pad_token_id,
+            graph_config=graph_config,
+        )
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
@@ -202,12 +267,20 @@ def main():
     cot_val = ["\n".join(d["steps"]) for d in json.load(open(configs.val_path))]
 
     base_dataset_valid = get_dataset(
-        configs.val_path, tokenizer, max_size=32 if configs.debug else 100000000
+        configs.val_path,
+        tokenizer,
+        max_size=32 if configs.debug else 100000000,
+        use_graph=configs.use_graph,
+        graph_sidecar_root=configs.graph_sidecar_root,
     )
 
     if not configs.only_eval:
         base_dataset_train = get_dataset(
-            configs.train_path, tokenizer, max_size=5000 if configs.debug else 100000000
+            configs.train_path,
+            tokenizer,
+            max_size=5000 if configs.debug else 100000000,
+            use_graph=configs.use_graph,
+            graph_sidecar_root=configs.graph_sidecar_root,
         )
 
     if "gsm" in configs.val_path:
@@ -237,7 +310,12 @@ def main():
 
     best_acc = 0
 
-    collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
+    collator = MyCollator(
+        tokenizer,
+        latent_id=latent_id,
+        label_pad_token_id=-100,
+        use_graph=configs.use_graph,
+    )
 
     for epoch in range(configs.resume, configs.num_epochs):
 
@@ -377,6 +455,17 @@ def main():
                         "train/loss": loss.detach().float()
                         * configs.gradient_accumulation_steps,
                     }
+                    if getattr(outputs, "align_loss", None) is not None:
+                        log_dict["train/align_loss"] = (
+                            outputs.align_loss.detach().float()
+                        )
+                    if getattr(outputs, "graph_embedding", None) is not None:
+                        log_dict["train/graph_embed_norm"] = (
+                            outputs.graph_embedding.detach()
+                            .float()
+                            .norm(dim=-1)
+                            .mean()
+                        )
                     wandb_run.log(log_dict)
 
                 pbar.set_description(

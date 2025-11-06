@@ -5,6 +5,7 @@ import json
 import itertools
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -14,7 +15,33 @@ from transformers import PreTrainedTokenizerBase
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 
 
-def get_dataset(path, tokenizer, max_size=1000000000):
+def _infer_split_from_path(path: Path) -> str:
+    stem = path.stem.lower()
+    for candidate in ("train", "valid", "val", "test", "dev"):
+        if stem.endswith(candidate):
+            return "valid" if candidate == "val" else candidate
+    raise ValueError(f"Unable to infer split name from path '{path}'")
+
+
+def _load_graph_manifest(graph_sidecar_root: Optional[str], split: str) -> Optional[dict]:
+    if not graph_sidecar_root:
+        return None
+
+    split_dir = Path(graph_sidecar_root) / split
+    manifest_path = split_dir / f"manifest_{split}.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Expected graph manifest at '{manifest_path}'")
+    with manifest_path.open() as f:
+        return json.load(f)
+
+
+def get_dataset(
+    path,
+    tokenizer,
+    max_size=1000000000,
+    use_graph: bool = False,
+    graph_sidecar_root: Optional[str] = None,
+):
 
     def tokenize_sample(sample):
 
@@ -34,11 +61,31 @@ def get_dataset(path, tokenizer, max_size=1000000000):
             "steps_tokenized": steps_tokenized,
             "answer_tokenized": answer_tokenized,
             "idx": sample["idx"],
+            "graph_path": sample.get("graph_path"),
         }
         return sample
 
+    path_obj = Path(path)
+    split_name = _infer_split_from_path(path_obj)
+    graph_manifest = _load_graph_manifest(graph_sidecar_root, split_name) if use_graph else None
+
     data = json.load(open(path))[:max_size]
     data = [{**d, "idx": idx} for idx, d in enumerate(data)]
+
+    if use_graph:
+        if graph_manifest is None:
+            raise ValueError(
+                "Graph usage requested but graph manifest not provided. "
+                "Ensure preprocessing has been run and graph_sidecar_root is set."
+            )
+        for sample in data:
+            key = str(sample["idx"])
+            if key not in graph_manifest:
+                raise KeyError(f"Missing graph entry for sample idx={sample['idx']}")
+            sample["graph_path"] = graph_manifest[key]
+    else:
+        for sample in data:
+            sample["graph_path"] = None
 
     keys = data[0].keys()
     dataset = Dataset.from_dict({k: [d[k] for d in data] for k in keys})
@@ -82,6 +129,7 @@ class MyCollator:
     tokenizer: PreTrainedTokenizerBase
     latent_id: Optional[int] = None
     label_pad_token_id: Optional[int] = -100
+    use_graph: bool = False
 
     def __call__(self, features, return_tensors=None):
 
@@ -99,11 +147,12 @@ class MyCollator:
         ("x" is word token, "-" is pad token)
         """
 
-        earliest_latent = [
-            feature["input_ids"].index(self.latent_id)
-            for feature in features
-            if self.latent_id in feature["input_ids"]
-        ]
+        earliest_latent = []
+        for feature in features:
+            if self.use_graph:
+                feature.setdefault("graph_path", None)
+            if self.latent_id in feature["input_ids"]:
+                earliest_latent.append(feature["input_ids"].index(self.latent_id))
 
         if len(earliest_latent) > 0:  # if there are continuous thoughts in the sequence
             latest_earliest_latent = max(earliest_latent)
@@ -134,7 +183,7 @@ class MyCollator:
             {
                 k: v
                 for k, v in feature.items()
-                if k != label_name and k != "position_ids"
+                if k not in {label_name, "position_ids", "graph_path"}
             }
             for feature in features
         ]
@@ -182,7 +231,58 @@ class MyCollator:
                 batch["position_ids"], dtype=torch.int64
             )
 
+        if self.use_graph:
+            graph_tensors = self._collate_graphs(features)
+            batch.update(graph_tensors)
+
         return batch
+
+    def _collate_graphs(self, features):
+        graph_paths = [feature.get("graph_path") for feature in features]
+        if any(path is None for path in graph_paths):
+            raise ValueError("Graph conditioning enabled but a batch item is missing graph_path")
+
+        xs = []
+        roles = []
+        batches = []
+        edge_indices = []
+        node_offset = 0
+
+        for batch_idx, path in enumerate(graph_paths):
+            graph_data = torch.load(path, map_location="cpu")
+            x = graph_data["x"].float()
+            edge_index = graph_data["edge_index"].long()
+            role = graph_data.get("role")
+
+            if x.dim() != 2:
+                raise ValueError(f"Expected node feature matrix of shape [N, D], got {x.shape}")
+            if edge_index.dim() != 2 or edge_index.shape[0] != 2:
+                raise ValueError("edge_index must have shape [2, E]")
+            if role is None:
+                role = torch.zeros((x.size(0),), dtype=torch.long)
+            else:
+                role = role.long()
+
+            xs.append(x)
+            roles.append(role)
+            batches.append(torch.full((x.size(0),), batch_idx, dtype=torch.long))
+            edge_indices.append(edge_index + node_offset)
+            node_offset += x.size(0)
+
+        x_cat = torch.cat(xs, dim=0)
+        role_cat = torch.cat(roles, dim=0)
+        batch_vec = torch.cat(batches, dim=0)
+        if edge_indices:
+            edge_index_cat = torch.cat(edge_indices, dim=1)
+        else:
+            edge_index_cat = torch.empty((2, 0), dtype=torch.long)
+
+        return {
+            "graph_x": x_cat,
+            "graph_edge_index": edge_index_cat,
+            "graph_batch": batch_vec,
+            "graph_role": role_cat,
+        }
 
 
 def get_question_latent_dataset(
@@ -220,6 +320,7 @@ def get_question_latent_dataset(
             "idx": sample["idx"],
             "attention_mask": [1] * len(tokens),
             "position_ids": list(range(len(tokens))),
+            "graph_path": sample.get("graph_path"),
         }
 
     return base_dataset_valid.map(
@@ -299,6 +400,7 @@ def get_cot_latent_dataset(
             "attention_mask": [1] * len(tokens),
             "idx": sample["idx"],
             "position_ids": list(range(len(tokens))),
+            "graph_path": sample.get("graph_path"),
         }
 
     if torch.cuda.device_count() > 1:
