@@ -527,6 +527,7 @@ def main():
             torch.tensor(0, device=rank),
             torch.tensor(0, device=rank),
         )
+        generated_tokens_sum = torch.tensor(0.0, device=rank)
 
         with torch.no_grad():
             parallel_model.module.eval()
@@ -559,6 +560,7 @@ def main():
                 cot_output = (
                     ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()
                 )
+                generated_tokens_sum += outputs.shape[1] - batch["input_ids"].shape[1]
 
                 if idx < 5 and rank == 0:
                     # print some examples
@@ -582,17 +584,27 @@ def main():
         dist.all_reduce(cor_cot, op=dist.ReduceOp.SUM)
         dist.all_reduce(cor, op=dist.ReduceOp.SUM)
         dist.all_reduce(total, op=dist.ReduceOp.SUM)
+        dist.all_reduce(generated_tokens_sum, op=dist.ReduceOp.SUM)
 
         cor_cot = cor_cot.item()
         cor = cor.item()
         total = total.item()
+        generated_tokens_total = generated_tokens_sum.item()
+        avg_generated_tokens = generated_tokens_total / max(total, 1)
         if rank == 0:
+            print(f"Average generated tokens: {avg_generated_tokens}")
             print(f"Accuracy on validation set: {cor} / {total} = {cor/total}")
             print(f"CoT match on validation set: {cor_cot} / {total} = {cor_cot/total}")
         sys.stdout.flush()
 
         if wandb_run:
-            wandb_run.log({"eval/acc": cor / total, "eval/cot_em": cor_cot / total})
+            wandb_run.log(
+                {
+                    "eval/acc": cor / total,
+                    "eval/cot_em": cor_cot / total,
+                    "eval/generated_tokens_avg": avg_generated_tokens,
+                }
+            )
 
         if configs.only_eval:
             break
