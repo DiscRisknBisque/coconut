@@ -96,6 +96,27 @@ class Coconut(nn.Module):
         self.align_loss_weight = graph_config.get("align_loss_weight", 0.0)
         self.latent_injection = graph_config.get("latent_injection", "residual")
 
+    def _slice_graph_for_analysis(self, graph_batch, graph_edge_index, batch_index):
+        node_indices = (graph_batch == batch_index).nonzero(as_tuple=False).view(-1)
+        if node_indices.numel() == 0:
+            return node_indices, torch.empty((2, 0), dtype=torch.long, device=graph_batch.device)
+
+        edge_mask = (
+            (graph_batch[graph_edge_index[0]] == batch_index)
+            & (graph_batch[graph_edge_index[1]] == batch_index)
+        )
+        scoped_edges = graph_edge_index[:, edge_mask]
+        remap = torch.full(
+            (graph_batch.shape[0],),
+            -1,
+            dtype=torch.long,
+            device=graph_batch.device,
+        )
+        remap[node_indices] = torch.arange(
+            node_indices.numel(), dtype=torch.long, device=graph_batch.device
+        )
+        return node_indices, remap[scoped_edges]
+
     def forward(
         self,
         input_ids,
@@ -106,22 +127,48 @@ class Coconut(nn.Module):
         graph_edge_index=None,
         graph_batch=None,
         graph_role=None,
+        analysis_trace: Optional[dict] = None,
+        analysis_batch_index: int = 0,
         **kwargs,
     ):
+
+        analysis_enabled = analysis_trace is not None
 
         if self.use_graph:
             if graph_x is None or graph_edge_index is None or graph_batch is None:
                 raise ValueError(
                     "Graph conditioning requested but graph inputs are missing."
                 )
-            z_g, _ = self.graph_encoder(graph_x, graph_edge_index, graph_batch)
+            z_g, h_nodes = self.graph_encoder(graph_x, graph_edge_index, graph_batch)
             graph_embedding = self.graph_projector(z_g)
+            node_embeddings = self.graph_projector(h_nodes)
             graph_prefix = (
                 self.graph_prefix_adapter(graph_embedding)
                 if self.graph_prefix_len > 0
                 else None
             )
             graph_residual = self.graph_residual_norm(graph_embedding)
+
+            if analysis_enabled:
+                if analysis_batch_index < 0 or analysis_batch_index >= z_g.shape[0]:
+                    raise IndexError(
+                        f"analysis_batch_index={analysis_batch_index} is out of range for batch size {z_g.shape[0]}"
+                    )
+                node_indices, edge_index_local = self._slice_graph_for_analysis(
+                    graph_batch, graph_edge_index, analysis_batch_index
+                )
+                role_local = (
+                    graph_role[node_indices]
+                    if graph_role is not None
+                    else torch.zeros((node_indices.numel(),), dtype=torch.long, device=graph_batch.device)
+                )
+                analysis_trace["node_embeddings"] = (
+                    node_embeddings[node_indices].detach().cpu()
+                )
+                analysis_trace["edge_index"] = edge_index_local.detach().cpu()
+                analysis_trace["role"] = role_local.detach().cpu()
+                analysis_trace["node_count"] = int(node_indices.numel())
+                analysis_trace.setdefault("trajectory", [])
         else:
             graph_embedding = None
             graph_prefix = None
@@ -260,6 +307,10 @@ class Coconut(nn.Module):
                 ):
                     new_state = new_state + graph_residual[batch_idx]
 
+                if analysis_enabled and batch_idx == analysis_batch_index:
+                    analysis_trace.setdefault("trajectory", []).append(
+                        new_state.detach().cpu()
+                    )
                 tensor_list[batch_idx][token_idx] = new_state
 
             inputs_embeds = torch.stack(
@@ -338,6 +389,8 @@ class Coconut(nn.Module):
         graph_edge_index=None,
         graph_batch=None,
         graph_role=None,
+        analysis_trace: Optional[dict] = None,
+        analysis_batch_index: int = 0,
         **kwargs
     ):
 
@@ -364,6 +417,8 @@ class Coconut(nn.Module):
             graph_edge_index=graph_edge_index,
             graph_batch=graph_batch,
             graph_role=graph_role,
+            analysis_trace=analysis_trace,
+            analysis_batch_index=analysis_batch_index,
         )
         inputs_embeds = outputs.inputs_embeds
 

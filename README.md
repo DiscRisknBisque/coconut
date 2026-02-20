@@ -92,25 +92,55 @@ python preprocessing/graphify_prosqa.py \
 
 Each command writes per-example tensors to `*.pt` files and a `manifest_<split>.json` file inside the target directory. Ensure `graph_sidecar_root` in your YAML configuration points at the parent directory (for example, `data/prontoqa_graphs`).
 
+## Latent Cartographer (ProsQA)
+
+`analysis/latent_cartographer.py` decodes Coconut's latent trajectory into nearest graph nodes and writes map/path artifacts for one ProsQA sample.
+
+Install analysis dependencies:
+
+```bash
+pip install scikit-learn matplotlib pillow
+```
+
+Run cartography on one validation sample:
+
+```bash
+python analysis/latent_cartographer.py \
+  --config args/prosqa_coconut_gnn.yaml \
+  --checkpoint models/checkpoint_49 \
+  --split valid \
+  --sample-idx 1 \
+  --metric cosine \
+  --output-dir analysis_outputs \
+  --save-gif
+```
+
+Outputs are written under `analysis_outputs/<split>_<sample_idx>/`:
+
+- `node_embeddings.pt`
+- `reasoning_trajectory.pt`
+- `similarity.pt`
+- `decoded_path.json`
+- `metrics.json`
+- `cartography.png`
+- `cartography.gif` (when `--save-gif` is set)
+
 ## Arguments
 
 The configuration of a run should be specified in a yaml file (an example can be found [here](args/gsm_coconut.yaml)).
 
 - **General settings**
-
   - **project**: Project name for wandb
   - **save_path**: Your path to store the checkpoints
   - **only_eval**: If true, only load a model and test on the data from `val_path` (must used along with `load_model_path`). Otherwise, train the model on `train_path` and test on `val_path` after every epoch.
 
 - **Method**
-
   - **coconut**: Train coconut model
   - **cot**: Train cot model
   - **no_thoughts**: Train coconut (w/o thought) model
   - **no_cot**: Train no-cot model
 
 - **Training settings**
-
   - **c_thought**: Number of continuous thoughts for each reasoning step
   - **epochs_per_stage**: Number of epochs for every training stage
   - **max_latent_stage**: The maximum number of training stages (in addition to the initial stage)

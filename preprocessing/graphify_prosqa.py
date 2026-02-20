@@ -3,55 +3,14 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
-from graph_utils import default_arg_parser, save_graph_sidecars
-
-
-SENTENCE_PATTERN = re.compile(r"(?<=[.?!])\s+")
-
-
-def _split_question(text: str) -> tuple[list[str], str]:
-    if not text:
-        return [], ""
-    parts = [segment.strip() for segment in SENTENCE_PATTERN.split(text) if segment.strip()]
-    if not parts:
-        return [], text
-    if parts[-1].endswith("?") or parts[-1].endswith("."):
-        question = parts[-1]
-        premises = parts[:-1]
-    else:
-        question = parts[-1]
-        premises = parts[:-1]
-    return premises, question
-
-
-def _prosqa_nodes(item):
-    entries = []
-    step_indices = []
-
-    premises = item.get("premises") or item.get("context") or []
-    question_text = item.get("question", "")
-
-    if premises:
-        for premise in premises:
-            entries.append(("premise", premise))
-        question_node = question_text
-    else:
-        premise_sentences, question_node = _split_question(question_text)
-        for premise in premise_sentences:
-            entries.append(("premise", premise))
-
-    steps = item.get("steps", []) or []
-    for step in steps:
-        step_indices.append(len(entries))
-        entries.append(("step", step))
-
-    if question_node:
-        entries.append(("question", question_node))
-
-    return entries, step_indices
+try:
+    from .graph_utils import default_arg_parser, save_graph_sidecars
+    from .prosqa_nodes import extract_prosqa_nodes
+except ImportError:
+    from graph_utils import default_arg_parser, save_graph_sidecars
+    from prosqa_nodes import extract_prosqa_nodes
 
 
 def main():
@@ -65,9 +24,14 @@ def main():
         data = json.load(f)
 
     dataset = [{**item, "idx": idx} for idx, item in enumerate(data)]
-    save_graph_sidecars(dataset, output_dir, args.split, node_extractor=_prosqa_nodes, dim=args.dim)
+    save_graph_sidecars(
+        dataset,
+        output_dir,
+        args.split,
+        node_extractor=extract_prosqa_nodes,
+        dim=args.dim,
+    )
 
 
 if __name__ == "__main__":
     main()
-

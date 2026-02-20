@@ -1,0 +1,6 @@
+.venv/
+analysis_outputs/
+.pytest_cache/
+__pycache__/
+models/*
+data/prosqa_graphs/
