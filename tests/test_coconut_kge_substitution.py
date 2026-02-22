@@ -1,7 +1,7 @@
-import pytest
-import torch
+import json
+from pathlib import Path
 
-pytest.importorskip("torch_geometric")
+import torch
 
 from coconut import Coconut
 
@@ -54,8 +54,16 @@ class DummyLM(torch.nn.Module):
         )()
 
 
-def test_trace_capture_is_opt_in_and_collects_latent_trajectory():
-    base = DummyLM()
+def _write_kge_artifacts(tmp_path: Path):
+    entity = torch.randn(4, 6)
+    torch.save(entity, tmp_path / "entity_embeddings.pt")
+    with (tmp_path / "metadata.json").open("w") as f:
+        json.dump({"projector_in_dim": 6}, f)
+
+
+def test_kge_span_substitution_replaces_anchor_tokens(tmp_path):
+    _write_kge_artifacts(tmp_path)
+    base = DummyLM(hidden_size=8)
     model = Coconut(
         base,
         latent_token_id=3,
@@ -63,60 +71,41 @@ def test_trace_capture_is_opt_in_and_collects_latent_trajectory():
         end_latent_id=5,
         eos_token_id=1,
         pad_token_id=0,
-        graph_config={
-            "use_graph": True,
-            "graph_encoder": "gcn2",
-            "graph_dim": 6,
-            "graph_hidden_dim": 6,
-            "graph_input_dim": 6,
-            "graph_prefix_len": 0,
+        kge_config={
+            "use_kge": True,
+            "kge_artifact_root": str(tmp_path),
+            "kge_entity_embeddings_file": "entity_embeddings.pt",
+            "kge_metadata_file": "metadata.json",
+            "kge_projector_hidden": 10,
+            "kge_projector_activation": "gelu",
+            "kge_projector_layernorm": True,
             "align_loss_weight": 0.0,
             "latent_injection": "residual",
         },
     )
 
-    input_ids = torch.tensor([[1, 3, 2]])
+    input_ids = torch.tensor([[1, 2, 1]])
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
     position_ids = torch.arange(input_ids.size(1)).unsqueeze(0)
 
-    graph_x = torch.randn(3, 6)
-    graph_edge_index = torch.tensor([[0, 1, 1], [1, 0, 2]], dtype=torch.long)
-    graph_batch = torch.zeros(3, dtype=torch.long)
-    graph_role = torch.tensor([0, 1, 2], dtype=torch.long)
+    anchor_entity_ids = torch.tensor([[0, -1, -1]])
+    anchor_token_spans = torch.tensor([[[1, 2], [0, 0], [0, 0]]])
+    anchor_mask = torch.tensor([[True, False, False]])
 
-    outputs_no_trace = model(
+    outputs = model(
         input_ids,
         attention_mask,
         labels,
         position_ids,
-        graph_x=graph_x,
-        graph_edge_index=graph_edge_index,
-        graph_batch=graph_batch,
-        graph_role=graph_role,
-    )
-    assert outputs_no_trace.loss.ndim == 0
-
-    trace = {}
-    outputs_trace = model(
-        input_ids,
-        attention_mask,
-        labels,
-        position_ids,
-        graph_x=graph_x,
-        graph_edge_index=graph_edge_index,
-        graph_batch=graph_batch,
-        graph_role=graph_role,
-        analysis_trace=trace,
-        analysis_batch_index=0,
+        anchor_entity_ids=anchor_entity_ids,
+        anchor_token_spans=anchor_token_spans,
+        anchor_mask=anchor_mask,
     )
 
-    assert outputs_trace.loss.ndim == 0
-    assert "node_embeddings" in trace
-    assert "trajectory" in trace
-    assert "edge_index" in trace
-    assert "role" in trace
-    assert trace["node_embeddings"].shape[0] == 3
-    assert trace["node_embeddings"].shape[1] == base.embedding.embedding_dim
-    assert len(trace["trajectory"]) == 1
+    projected = model.project_entity_ids(torch.tensor([[0]]))[0, 0]
+    replaced = outputs.inputs_embeds[0, 1]
 
+    assert torch.allclose(replaced, projected, atol=1e-5)
+    assert outputs.kge_embedding is not None
+    assert outputs.loss.ndim == 0

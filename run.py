@@ -1,55 +1,81 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
+import argparse
+import functools
+import gc
+import json
+import os
+import sys
+
 import torch
 import torch.distributed
 import torch.optim as optim
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
 import wandb
-
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-from transformers.models.gpt2.modeling_gpt2 import GPT2Block
-
-from coconut import Coconut
-from dataset import (
-    get_dataset,
-    get_question_latent_dataset,
-    get_cot_latent_dataset,
-    MyCollator,
-)
-
-from tqdm import tqdm
-from copy import copy
-import itertools
-import os, sys
 import yaml
-import json
-import gc
-import argparse
-import functools
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+
+import torch.distributed as dist
+from coconut import Coconut
+from dataset import MyCollator, get_cot_latent_dataset, get_dataset, get_question_latent_dataset
 from utils import Config, set_seed
 
 
-def main():
+def _freeze_base_llm_if_configured(model, configs) -> int:
+    if not (
+        getattr(configs, "freeze_base_llm", True)
+        and getattr(configs, "coconut", False)
+        and getattr(configs, "use_kge", False)
+    ):
+        return 0
+    if not hasattr(model, "base_causallm"):
+        return 0
 
+    frozen = 0
+    for param in model.base_causallm.parameters():
+        if param.requires_grad:
+            param.requires_grad = False
+            frozen += param.numel()
+    return frozen
+
+
+def _trainable_parameters(module):
+    return [p for p in module.parameters() if p.requires_grad]
+
+
+def _resolve_distributed_env(local_rank: int):
+    """Pick the best distributed backend and compute device for this machine."""
+    if torch.cuda.is_available():
+        backend = "nccl"
+        device = torch.device("cuda", local_rank)
+        torch.cuda.set_device(local_rank)
+    else:
+        backend = "gloo"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+    return backend, device
+
+
+def main():
     parser = argparse.ArgumentParser(description="coconut")
     parser.add_argument("config_file")
     args = parser.parse_args()
 
-    # init distributed environment
-    dist.init_process_group("nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)
 
-    # load the configuration file
+    backend, device = _resolve_distributed_env(local_rank)
+    dist.init_process_group(backend)
+
     with open(args.config_file) as f:
         config_dict = yaml.safe_load(f)
 
@@ -59,30 +85,40 @@ def main():
     configs = Config(config_dict)
     set_seed(configs.seed)
 
-    default_graph_config = {
-        "use_graph": False,
-        "graph_encoder": "gcn2",
-        "graph_dim": 256,
-        "graph_prefix_len": 4,
+    default_kge_config = {
+        "use_kge": False,
+        "kge_artifact_root": None,
+        "kge_entity_embeddings_file": "entity_embeddings.pt",
+        "kge_relation_embeddings_file": "relation_embeddings.pt",
+        "kge_entity_to_id_file": "entity_to_id.json",
+        "kge_metadata_file": "metadata.json",
+        "kge_anchor_policy": "query_anchors",
+        "kge_projector_hidden": None,
+        "kge_projector_activation": "gelu",
+        "kge_projector_layernorm": True,
         "align_loss_weight": 0.0,
         "latent_injection": "residual",
-        "graph_sidecar_root": None,
-        "graph_dropout": 0.1,
-        "graph_projector_hidden": None,
-        "graph_projector_dropout": None,
-        "graph_prefix_dropout": None,
-        "graph_hidden_dim": None,
-        "graph_input_dim": 259,
+        "freeze_base_llm": True,
     }
 
-    for key, value in default_graph_config.items():
+    for key, value in default_kge_config.items():
         if not hasattr(configs, key):
             setattr(configs, key, value)
 
-    if configs.use_graph and not configs.graph_sidecar_root:
+    if configs.use_kge and not configs.kge_artifact_root:
         raise ValueError(
-            "Graph conditioning enabled but 'graph_sidecar_root' is not configured."
+            "KGE conditioning enabled but 'kge_artifact_root' is not configured."
         )
+
+    kge_entity_to_id_path = None
+    if configs.use_kge:
+        kge_entity_to_id_path = os.path.join(
+            configs.kge_artifact_root, configs.kge_entity_to_id_file
+        )
+        if not os.path.exists(kge_entity_to_id_path):
+            raise FileNotFoundError(
+                f"Missing entity mapping file for KGE mode: {kge_entity_to_id_path}"
+            )
 
     save_dir = os.path.join(configs.save_path, configs.name)
 
@@ -92,22 +128,16 @@ def main():
     torch.distributed.barrier()
     cur_ckpts = os.listdir(save_dir)
 
-    # check if the job is preempted and resumed.
-
     if len(cur_ckpts) > 0 and not configs.only_eval:
-        # if there are previous checkpoints, and only_eval is False
-        # it means the previous run was preempted and the program is restarted.
-        # need to find the latest checkpoint and resume from that.
-
         if rank == 0:
             print(
-                f"Warning: found previous run and gonna resume from that. the inputted `resume` argument is ignored!"
+                "Warning: found previous run and gonna resume from that. "
+                "the inputted `resume` argument is ignored!"
             )
 
         checkpoints = [f for f in cur_ckpts if f.startswith("checkpoint_")]
         checkpoints.sort(key=lambda x: int(x.split("_")[1]))
 
-        # Get the last item in the sorted list
         latest_checkpoint = checkpoints[-1] if checkpoints else None
         configs.resume = int(latest_checkpoint.split("_")[1])
         load_dir = os.path.join(configs.save_path, configs.name, latest_checkpoint)
@@ -116,12 +146,11 @@ def main():
         print(f"Loading from previous run epoch_{configs.resume}!")
 
     elif configs.resume != 0:
-        # by setting `resume`, we can skip a few epoches at the beginning.
         if configs.load_model_path == "None":
             print(
-                f"Warning: you want to skip the first {configs.resume} but you are not loading any existing checkpoint!"
+                f"Warning: you want to skip the first {configs.resume} "
+                "but you are not loading any existing checkpoint!"
             )
-            # not an intended use case at this point
         print(
             f"Loading from {configs.load_model_path} and skip the first {configs.resume} epochs"
         )
@@ -136,49 +165,31 @@ def main():
     start_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
     end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
 
-    graph_config = {
-        "use_graph": configs.use_graph,
-        "graph_encoder": configs.graph_encoder,
-        "graph_dim": configs.graph_dim,
-        "graph_prefix_len": configs.graph_prefix_len,
+    kge_config = {
+        "use_kge": configs.use_kge,
+        "kge_artifact_root": configs.kge_artifact_root,
+        "kge_entity_embeddings_file": configs.kge_entity_embeddings_file,
+        "kge_relation_embeddings_file": configs.kge_relation_embeddings_file,
+        "kge_entity_to_id_file": configs.kge_entity_to_id_file,
+        "kge_metadata_file": configs.kge_metadata_file,
+        "kge_anchor_policy": configs.kge_anchor_policy,
+        "kge_projector_hidden": configs.kge_projector_hidden,
+        "kge_projector_activation": configs.kge_projector_activation,
+        "kge_projector_layernorm": configs.kge_projector_layernorm,
         "align_loss_weight": configs.align_loss_weight,
         "latent_injection": configs.latent_injection,
-        "graph_dropout": configs.graph_dropout,
-        "graph_projector_hidden": (
-            configs.graph_projector_hidden
-            if configs.graph_projector_hidden is not None
-            else configs.graph_dim
-        ),
-        "graph_projector_dropout": (
-            configs.graph_projector_dropout
-            if configs.graph_projector_dropout is not None
-            else configs.graph_dropout
-        ),
-        "graph_prefix_dropout": (
-            configs.graph_prefix_dropout
-            if configs.graph_prefix_dropout is not None
-            else configs.graph_dropout
-        ),
-        "graph_hidden_dim": (
-            configs.graph_hidden_dim
-            if configs.graph_hidden_dim is not None
-            else configs.graph_dim
-        ),
-        "graph_input_dim": configs.graph_input_dim,
     }
 
     loaded = False
 
     if configs.load_model_path != "None":
         saved_weights = torch.load(
-            configs.load_model_path, map_location=torch.device(rank)
+            configs.load_model_path, map_location=device
         )
 
         if configs.coconut and not any(
             [k.startswith("base_causallm") for k in saved_weights.keys()]
         ):
-            # we are loading a base model into coconut model
-            # e.g., for GSM8k, we used a SFTed model to skip the stage 0
             loaded = True
             print(model.load_state_dict(saved_weights, strict=False))
 
@@ -190,26 +201,19 @@ def main():
         elif configs.coconut and any(
             [k.startswith("base_causallm") for k in saved_weights.keys()]
         ):
-            # loading from preempted run
-            # will handle later
             pass
 
         else:
-            # resume or evaluate sft model
             loaded = True
             print(model.load_state_dict(saved_weights, strict=False))
 
     if not (configs.cot or configs.no_thoughts or configs.no_cot):
-        # if we need new tokens, initialize their embeddings and lm heads
         model.resize_token_embeddings(len(tokenizer))
         embeddings = model.get_input_embeddings()
         target_id = tokenizer.convert_tokens_to_ids("<<")
-        # initialize the new token embeddings with a known token
-        # it helps stablize the training
         for token_id in [latent_id, start_id, end_id]:
-            target_embedding = embeddings.weight.data[target_id] 
+            target_embedding = embeddings.weight.data[target_id]
             embeddings.weight.data[token_id] = target_embedding
-            # The input embeddings and lm heads are tied in GPT2. So the code below is not necessary
             lm_head = model.lm_head
             lm_head.weight.data[token_id] = lm_head.weight.data[target_id]
 
@@ -225,41 +229,44 @@ def main():
             end_id,
             tokenizer.eos_token_id,
             tokenizer.pad_token_id,
-            graph_config=graph_config,
+            kge_config=kge_config,
         )
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
 
-    print(f"Running FSDP on rank = {rank}, world size = {world_size}")
-    model = model.to(rank)
+    frozen_params = _freeze_base_llm_if_configured(model, configs)
+    if rank == 0 and frozen_params > 0:
+        print(f"Froze {frozen_params} base-LLM parameters for KGE alignment phase.")
+
+    print(f"Running on rank={rank}, world_size={world_size}, device={device}")
+    model = model.to(device)
 
     llama_auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
-            # GPT2Block,       # for GPT2, we don't need to shard layers (it becomes DDP)
-            LlamaDecoderLayer  # only shard llama's layers.
+            LlamaDecoderLayer,
         },
     )
 
     if configs.bf16:
         model.to(torch.bfloat16)
 
-    # if only eval, use ddp (to avoid bugs in fsdp)
-    if configs.only_eval:
-        parallel_model = DDP(model, device_ids=[rank])
-
+    if torch.cuda.is_available():
+        if configs.only_eval:
+            parallel_model = DDP(model, device_ids=[local_rank])
+        else:
+            parallel_model = FSDP(
+                model, auto_wrap_policy=llama_auto_wrap_policy, device_id=device
+            )
     else:
-        parallel_model = FSDP(
-            model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank
-        )
+        parallel_model = DDP(model)
 
     del model
 
     if rank == 0:
         print(parallel_model)
 
-    # prepare the ground truth answer and cot for evaluation
     question_val = [d["question"] for d in json.load(open(configs.val_path))]
     answers_val = [
         d["answer"].replace(",", "").strip() for d in json.load(open(configs.val_path))
@@ -270,8 +277,9 @@ def main():
         configs.val_path,
         tokenizer,
         max_size=32 if configs.debug else 100000000,
-        use_graph=configs.use_graph,
-        graph_sidecar_root=configs.graph_sidecar_root,
+        use_kge=configs.use_kge,
+        kge_entity_to_id_path=kge_entity_to_id_path,
+        kge_anchor_policy=configs.kge_anchor_policy,
     )
 
     if not configs.only_eval:
@@ -279,8 +287,9 @@ def main():
             configs.train_path,
             tokenizer,
             max_size=5000 if configs.debug else 100000000,
-            use_graph=configs.use_graph,
-            graph_sidecar_root=configs.graph_sidecar_root,
+            use_kge=configs.use_kge,
+            kge_entity_to_id_path=kge_entity_to_id_path,
+            kge_anchor_policy=configs.kge_anchor_policy,
         )
 
     if "gsm" in configs.val_path:
@@ -298,12 +307,13 @@ def main():
     else:
         wandb_run = None
 
-    if configs.reset_optimizer:
-        optimizer = None
-
-    else:
+    optimizer = None
+    if not configs.reset_optimizer:
+        trainable = _trainable_parameters(parallel_model)
+        if len(trainable) == 0:
+            raise RuntimeError("No trainable parameters found for optimizer initialization")
         optimizer = optim.AdamW(
-            parallel_model.parameters(),
+            trainable,
             lr=configs.lr,
             weight_decay=configs.weight_decay,
         )
@@ -314,11 +324,10 @@ def main():
         tokenizer,
         latent_id=latent_id,
         label_pad_token_id=-100,
-        use_graph=configs.use_graph,
+        use_kge=configs.use_kge,
     )
 
     for epoch in range(configs.resume, configs.num_epochs):
-
         scheduled_stage = (
             0 if (configs.cot or configs.no_cot) else epoch // configs.epochs_per_stage
         )
@@ -342,7 +351,6 @@ def main():
         )
 
         if not configs.only_eval:
-
             dataset_train = get_cot_latent_dataset(
                 scheduled_stage,
                 base_dataset_train,
@@ -363,9 +371,6 @@ def main():
                 collate_fn=collator,
                 sampler=DistributedSampler(dataset_train, shuffle=True),
             )
-
-            # the sampler is deterministic even if shuffle is set to True
-            # so we have shuffled the dataset when it's constructed (at every epoch).
 
             dataset_loss_val = get_cot_latent_dataset(
                 scheduled_stage,
@@ -388,10 +393,16 @@ def main():
             )
 
             if configs.reset_optimizer:
-                del optimizer
+                if optimizer is not None:
+                    del optimizer
 
+                trainable = _trainable_parameters(parallel_model)
+                if len(trainable) == 0:
+                    raise RuntimeError(
+                        "No trainable parameters found when resetting optimizer"
+                    )
                 optimizer = optim.AdamW(
-                    parallel_model.parameters(),
+                    trainable,
                     lr=configs.lr,
                     weight_decay=configs.weight_decay,
                 )
@@ -407,7 +418,6 @@ def main():
             )
 
             for step, batch in enumerate(train_dataloader):
-
                 if step == 0 and wandb_run and rank == 0:
                     print("logging training data")
                     cur_bs = len(batch["input_ids"])
@@ -419,21 +429,16 @@ def main():
                                 + " "
                                 + str(batch["labels"][data_idx][token_idx].item())
                                 + " "
-                                + tokenizer.decode(
-                                    batch["input_ids"][data_idx][token_idx]
-                                )
+                                + tokenizer.decode(batch["input_ids"][data_idx][token_idx])
                                 + "\n"
                             )
                         text_str += "====" * 10 + "\n"
                     text_table.add_data(total_train_steps, text_str)
-                    # copy the table due to a bug in wandb
-                    # https://github.com/wandb/wandb/issues/2981
-
-                    wandb_run.log({"data_table": copy(text_table)})
+                    wandb_run.log({"data_table": text_table})
 
                 total_train_steps += 1
                 batch = {
-                    key: batch[key].to(rank) for key in batch.keys() if key != "idx"
+                    key: batch[key].to(device) for key in batch.keys() if key != "idx"
                 }
 
                 outputs = parallel_model(**batch)
@@ -456,16 +461,13 @@ def main():
                         * configs.gradient_accumulation_steps,
                     }
                     if getattr(outputs, "align_loss", None) is not None:
-                        log_dict["train/align_loss"] = (
-                            outputs.align_loss.detach().float()
+                        log_dict["train/align_loss"] = outputs.align_loss.detach().float()
+                    if getattr(outputs, "kge_embedding", None) is not None:
+                        log_dict["train/kge_embed_norm"] = (
+                            outputs.kge_embedding.detach().float().norm(dim=-1).mean()
                         )
-                    if getattr(outputs, "graph_embedding", None) is not None:
-                        log_dict["train/graph_embed_norm"] = (
-                            outputs.graph_embedding.detach()
-                            .float()
-                            .norm(dim=-1)
-                            .mean()
-                        )
+                    if getattr(outputs, "anchor_coverage", None) is not None:
+                        log_dict["train/anchor_coverage"] = outputs.anchor_coverage.detach().float()
                     wandb_run.log(log_dict)
 
                 pbar.set_description(
@@ -482,25 +484,22 @@ def main():
             ):
                 states = parallel_model.state_dict()
                 if rank == 0:
-                    torch.save(
-                        states, os.path.join(save_dir, f"checkpoint_{epoch + 1}")
-                    )
+                    torch.save(states, os.path.join(save_dir, f"checkpoint_{epoch + 1}"))
                     print("saving model.")
 
                 dist.barrier()
                 del states
                 gc.collect()
-                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            # val loss
             total_loss = 0
 
             with torch.no_grad():
                 parallel_model.module.eval()
                 for step, batch in enumerate(valid_loss_dataloader):
-
                     batch = {
-                        key: batch[key].to(rank) for key in batch.keys() if key != "idx"
+                        key: batch[key].to(device) for key in batch.keys() if key != "idx"
                     }
 
                     outputs = parallel_model(**batch)
@@ -509,25 +508,23 @@ def main():
                     total_loss += loss.item() / world_size
 
                 if wandb_run and rank == 0:
-
                     log_dict = {
                         "eval/loss": total_loss / len(valid_loss_dataloader),
                     }
                     wandb_run.log(log_dict)
                     print("eval loss", total_loss / len(valid_loss_dataloader))
 
-        # val generation accuracy
         total_length = len(valid_gen_dataloader)
 
         pbar = tqdm(
-            colour="blue", desc=f"Test Accuracy", total=total_length, dynamic_ncols=True
+            colour="blue", desc="Test Accuracy", total=total_length, dynamic_ncols=True
         )
         cor, cor_cot, total = (
-            torch.tensor(0, device=rank),
-            torch.tensor(0, device=rank),
-            torch.tensor(0, device=rank),
+            torch.tensor(0, device=device),
+            torch.tensor(0, device=device),
+            torch.tensor(0, device=device),
         )
-        generated_tokens_sum = torch.tensor(0.0, device=rank)
+        generated_tokens_sum = torch.tensor(0.0, device=device)
 
         with torch.no_grad():
             parallel_model.module.eval()
@@ -535,11 +532,10 @@ def main():
                 test_idx = batch["idx"][0]
 
                 batch = {
-                    k: v.to(rank)
+                    k: v.to(device)
                     for k, v in batch.items()
-                    if v != None and k not in ["idx", "position_ids"]
+                    if v is not None and k not in ["idx", "position_ids"]
                 }
-                # https://github.com/huggingface/transformers/issues/32492
 
                 assert len(batch["input_ids"]) == 1
                 answer = answers_val[test_idx.cpu().item()]
@@ -548,7 +544,6 @@ def main():
 
                 total += 1
 
-                # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
                 outputs = parallel_model.module.generate(
                     **batch,
                     max_new_tokens=max_new_tokens,
@@ -557,13 +552,10 @@ def main():
 
                 text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
                 answer_output = text_output.split("#")[-1].replace(",", "").strip()
-                cot_output = (
-                    ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()
-                )
+                cot_output = (("\n".join(text_output.split("\n")[1:])).split("#")[0].strip())
                 generated_tokens_sum += outputs.shape[1] - batch["input_ids"].shape[1]
 
                 if idx < 5 and rank == 0:
-                    # print some examples
                     print(
                         f"Question {test_idx}: Answer = '{answer}' CoT = '{answer_cot}'"
                     )
@@ -627,7 +619,8 @@ def main():
             dist.barrier()
             del states
             gc.collect()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

@@ -1,26 +1,25 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
+import json
+from collections import namedtuple
+from pathlib import Path
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
-from collections import namedtuple
-from typing import Optional
-
 from transformers.models.gpt2 import GPT2LMHeadModel
-
-from graph_encoder import GraphPrefixAdapter, GraphProjector, build_graph_encoder
 
 Outputs = namedtuple(
     "Outputs",
-    ["loss", "inputs_embeds", "logits", "align_loss", "graph_embedding"],
+    ["loss", "inputs_embeds", "logits", "align_loss", "kge_embedding", "anchor_coverage"],
 )
 MAX_N_LATENT = 8
 
 
 class Coconut(nn.Module):
-
     def __init__(
         self,
         base_causallm,
@@ -29,9 +28,8 @@ class Coconut(nn.Module):
         end_latent_id,
         eos_token_id,
         pad_token_id,
-        graph_config: Optional[dict] = None,
+        kge_config: Optional[dict] = None,
     ):
-
         super(Coconut, self).__init__()
         self.gen_forward_cnt = 0
         self.base_causallm = base_causallm
@@ -41,81 +39,145 @@ class Coconut(nn.Module):
         self.end_latent_id = end_latent_id
         self.pad_token_id = pad_token_id
         self.label_pad_token_id = -100
-        self.use_graph = False
-        self.graph_prefix_len = 0
+        self.use_kge = False
         self.align_loss_weight = 0.0
         self.latent_injection = "none"
-        self.graph_dim = None
 
-        # tested with GPT2 and Llama3
         if isinstance(self.base_causallm, GPT2LMHeadModel):
             self.embedding = self.base_causallm.transformer.get_input_embeddings()
         else:
             self.embedding = self.base_causallm.get_input_embeddings()
 
-        if graph_config and graph_config.get("use_graph", False):
-            self._init_graph_modules(graph_config)
+        if kge_config and kge_config.get("use_kge", False):
+            self._init_kge_modules(kge_config)
 
-    def _init_graph_modules(self, graph_config: dict):
+    def _load_kge_embeddings(self, kge_config: dict) -> torch.Tensor:
+        artifact_root = Path(kge_config["kge_artifact_root"])
+        embedding_file = kge_config.get("kge_entity_embeddings_file", "entity_embeddings.pt")
+        metadata_file = kge_config.get("kge_metadata_file", "metadata.json")
+
+        embedding_path = artifact_root / embedding_file
+        if not embedding_path.exists():
+            raise FileNotFoundError(f"Missing KGE entity embedding file: {embedding_path}")
+        entity_embeddings = torch.load(embedding_path, map_location="cpu")
+        if not isinstance(entity_embeddings, torch.Tensor):
+            raise TypeError(
+                f"Expected entity embeddings at {embedding_path} to be a torch.Tensor"
+            )
+
+        if torch.is_complex(entity_embeddings):
+            entity_embeddings = torch.view_as_real(entity_embeddings).reshape(
+                entity_embeddings.shape[0], -1
+            )
+
+        entity_embeddings = entity_embeddings.float()
+
+        metadata_path = artifact_root / metadata_file
+        if metadata_path.exists():
+            with metadata_path.open() as f:
+                metadata = json.load(f)
+            expected_dim = metadata.get("projector_in_dim")
+            if expected_dim is not None and int(expected_dim) != entity_embeddings.shape[1]:
+                raise ValueError(
+                    "KGE embedding dim mismatch with metadata projector_in_dim: "
+                    f"{entity_embeddings.shape[1]} vs {expected_dim}"
+                )
+
+        return entity_embeddings
+
+    def _init_kge_modules(self, kge_config: dict):
         hidden_size = self.embedding.embedding_dim
-        graph_dim = graph_config.get("graph_dim", 256)
-        graph_input_dim = graph_config.get(
-            "graph_input_dim", graph_config.get("graph_feature_dim", 259)
-        )
-        graph_hidden_dim = graph_config.get("graph_hidden_dim", graph_dim)
-        graph_encoder_name = graph_config.get("graph_encoder", "gcn2")
-        prefix_len = graph_config.get("graph_prefix_len", 4)
-        projector_hidden = graph_config.get("graph_projector_hidden", graph_dim)
-        dropout = graph_config.get("graph_dropout", 0.1)
-        projector_dropout = graph_config.get("graph_projector_dropout", dropout)
-        prefix_dropout = graph_config.get("graph_prefix_dropout", dropout)
+        entity_embeddings = self._load_kge_embeddings(kge_config)
+        kge_input_dim = entity_embeddings.shape[1]
 
-        self.graph_encoder = build_graph_encoder(
-            graph_encoder_name,
-            d_in=graph_input_dim,
-            d_hidden=graph_hidden_dim,
-            d_out=graph_dim,
-            dropout=dropout,
-        )
-        self.graph_projector = GraphProjector(
-            d_in=graph_dim,
-            d_hidden=projector_hidden,
-            d_out=hidden_size,
-            dropout=projector_dropout,
-        )
-        self.graph_prefix_adapter = GraphPrefixAdapter(
-            hidden_size=hidden_size,
-            prefix_len=prefix_len,
-            dropout=prefix_dropout,
-        )
-        self.graph_residual_norm = nn.LayerNorm(hidden_size)
+        projector_hidden = kge_config.get("kge_projector_hidden", hidden_size)
+        activation = kge_config.get("kge_projector_activation", "gelu").lower()
+        use_layernorm = bool(kge_config.get("kge_projector_layernorm", True))
 
-        self.use_graph = True
-        self.graph_prefix_len = prefix_len
-        self.graph_dim = graph_dim
-        self.align_loss_weight = graph_config.get("align_loss_weight", 0.0)
-        self.latent_injection = graph_config.get("latent_injection", "residual")
+        layers = [nn.Linear(kge_input_dim, projector_hidden)]
+        if activation == "gelu":
+            layers.append(nn.GELU())
+        elif activation == "relu":
+            layers.append(nn.ReLU())
+        elif activation == "none":
+            pass
+        else:
+            raise ValueError(f"Unsupported kge_projector_activation='{activation}'")
 
-    def _slice_graph_for_analysis(self, graph_batch, graph_edge_index, batch_index):
-        node_indices = (graph_batch == batch_index).nonzero(as_tuple=False).view(-1)
-        if node_indices.numel() == 0:
-            return node_indices, torch.empty((2, 0), dtype=torch.long, device=graph_batch.device)
+        layers.append(nn.Linear(projector_hidden, hidden_size))
+        if use_layernorm:
+            layers.append(nn.LayerNorm(hidden_size))
 
-        edge_mask = (
-            (graph_batch[graph_edge_index[0]] == batch_index)
-            & (graph_batch[graph_edge_index[1]] == batch_index)
-        )
-        scoped_edges = graph_edge_index[:, edge_mask]
-        remap = torch.full(
-            (graph_batch.shape[0],),
-            -1,
-            dtype=torch.long,
-            device=graph_batch.device,
-        )
-        remap[node_indices] = torch.arange(
-            node_indices.numel(), dtype=torch.long, device=graph_batch.device
-        )
-        return node_indices, remap[scoped_edges]
+        self.kge_projector = nn.Sequential(*layers)
+        self.kge_residual_norm = nn.LayerNorm(hidden_size)
+
+        self.register_buffer("kge_entity_embeddings", entity_embeddings)
+        self.use_kge = True
+        self.align_loss_weight = kge_config.get("align_loss_weight", 0.0)
+        self.latent_injection = kge_config.get("latent_injection", "residual")
+
+    def project_entity_ids(self, entity_ids: torch.Tensor) -> torch.Tensor:
+        if not self.use_kge:
+            raise RuntimeError("KGE projection requested but use_kge=False")
+
+        max_id = self.kge_entity_embeddings.shape[0] - 1
+        safe_ids = entity_ids.clamp(min=0, max=max_id)
+        embeddings = self.kge_entity_embeddings[safe_ids]
+
+        if embeddings.ndim == 2:
+            return self.kge_projector(embeddings)
+        if embeddings.ndim == 3:
+            batch, anchors, dim = embeddings.shape
+            projected = self.kge_projector(embeddings.reshape(-1, dim))
+            return projected.view(batch, anchors, -1)
+        raise ValueError(f"Unsupported entity_ids lookup shape {tuple(embeddings.shape)}")
+
+    def _apply_anchor_substitution(
+        self,
+        inputs_embeds: torch.Tensor,
+        anchor_entity_ids: Optional[torch.Tensor],
+        anchor_token_spans: Optional[torch.Tensor],
+        anchor_mask: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if not self.use_kge:
+            return None, None, None, None
+
+        if anchor_entity_ids is None or anchor_token_spans is None or anchor_mask is None:
+            raise ValueError(
+                "KGE conditioning requested but anchor_entity_ids/anchor_token_spans/anchor_mask are missing."
+            )
+
+        num_entities = self.kge_entity_embeddings.shape[0]
+        valid_lookup = anchor_mask & (anchor_entity_ids >= 0) & (anchor_entity_ids < num_entities)
+        anchor_coverage = valid_lookup.float().mean()
+
+        if not valid_lookup.any():
+            return None, None, valid_lookup.any(dim=1), anchor_coverage
+
+        projected = self.project_entity_ids(anchor_entity_ids)
+        batch_size, _, hidden_size = projected.shape
+
+        seq_len = inputs_embeds.shape[1]
+        span_valid = valid_lookup.clone()
+
+        for batch_idx in range(batch_size):
+            for anchor_idx in range(projected.shape[1]):
+                if not bool(valid_lookup[batch_idx, anchor_idx]):
+                    continue
+                start, end = anchor_token_spans[batch_idx, anchor_idx].tolist()
+                if start < 0 or end <= start or end > seq_len:
+                    span_valid[batch_idx, anchor_idx] = False
+                    continue
+                replacement = projected[batch_idx, anchor_idx].view(1, hidden_size)
+                inputs_embeds[batch_idx, start:end, :] = replacement
+
+        valid_for_pool = span_valid.unsqueeze(-1).float()
+        pooled = (projected * valid_for_pool).sum(dim=1)
+        denom = valid_for_pool.sum(dim=1).clamp(min=1.0)
+        pooled = pooled / denom
+        pooled = self.kge_residual_norm(pooled)
+        has_anchor = span_valid.any(dim=1)
+        return pooled, projected, has_anchor, anchor_coverage
 
     def forward(
         self,
@@ -123,99 +185,40 @@ class Coconut(nn.Module):
         attention_mask,
         labels,
         position_ids,
-        graph_x=None,
-        graph_edge_index=None,
-        graph_batch=None,
-        graph_role=None,
+        anchor_entity_ids=None,
+        anchor_token_spans=None,
+        anchor_mask=None,
         analysis_trace: Optional[dict] = None,
         analysis_batch_index: int = 0,
         **kwargs,
     ):
-
         analysis_enabled = analysis_trace is not None
-
-        if self.use_graph:
-            if graph_x is None or graph_edge_index is None or graph_batch is None:
-                raise ValueError(
-                    "Graph conditioning requested but graph inputs are missing."
-                )
-            z_g, h_nodes = self.graph_encoder(graph_x, graph_edge_index, graph_batch)
-            graph_embedding = self.graph_projector(z_g)
-            node_embeddings = self.graph_projector(h_nodes)
-            graph_prefix = (
-                self.graph_prefix_adapter(graph_embedding)
-                if self.graph_prefix_len > 0
-                else None
-            )
-            graph_residual = self.graph_residual_norm(graph_embedding)
-
-            if analysis_enabled:
-                if analysis_batch_index < 0 or analysis_batch_index >= z_g.shape[0]:
-                    raise IndexError(
-                        f"analysis_batch_index={analysis_batch_index} is out of range for batch size {z_g.shape[0]}"
-                    )
-                node_indices, edge_index_local = self._slice_graph_for_analysis(
-                    graph_batch, graph_edge_index, analysis_batch_index
-                )
-                role_local = (
-                    graph_role[node_indices]
-                    if graph_role is not None
-                    else torch.zeros((node_indices.numel(),), dtype=torch.long, device=graph_batch.device)
-                )
-                analysis_trace["node_embeddings"] = (
-                    node_embeddings[node_indices].detach().cpu()
-                )
-                analysis_trace["edge_index"] = edge_index_local.detach().cpu()
-                analysis_trace["role"] = role_local.detach().cpu()
-                analysis_trace["node_count"] = int(node_indices.numel())
-                analysis_trace.setdefault("trajectory", [])
-        else:
-            graph_embedding = None
-            graph_prefix = None
-            graph_residual = None
 
         batch_size = input_ids.shape[0]
         inputs_embeds = self.embedding(input_ids)
 
-        if graph_prefix is not None:
-            inputs_embeds = torch.cat([graph_prefix, inputs_embeds], dim=1)
-            prefix_mask = torch.ones(
-                (batch_size, self.graph_prefix_len),
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
-            attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
-            prefix_positions = torch.arange(
-                self.graph_prefix_len, device=position_ids.device
-            ).unsqueeze(0)
-            prefix_positions = prefix_positions.expand(batch_size, -1)
-            position_ids = torch.cat([prefix_positions, position_ids + self.graph_prefix_len], dim=1)
-            if labels is not None:
-                prefix_labels = torch.full(
-                    (batch_size, self.graph_prefix_len),
-                    self.label_pad_token_id,
-                    dtype=labels.dtype,
-                    device=labels.device,
+        kge_embedding, _, has_anchor, anchor_coverage = self._apply_anchor_substitution(
+            inputs_embeds=inputs_embeds,
+            anchor_entity_ids=anchor_entity_ids,
+            anchor_token_spans=anchor_token_spans,
+            anchor_mask=anchor_mask,
+        )
+
+        if analysis_enabled:
+            if analysis_batch_index < 0 or analysis_batch_index >= batch_size:
+                raise IndexError(
+                    f"analysis_batch_index={analysis_batch_index} is out of range for batch size {batch_size}"
                 )
-                labels = torch.cat([prefix_labels, labels], dim=1)
-            pad_prefix = torch.full(
-                (batch_size, self.graph_prefix_len),
-                self.pad_token_id,
-                dtype=input_ids.dtype,
-                device=input_ids.device,
-            )
-            input_ids = torch.cat([pad_prefix, input_ids], dim=1)
+            analysis_trace.setdefault("trajectory", [])
 
         logits = []
 
-        latent_indices = (
-            input_ids == self.latent_token_id
-        ).nonzero()  # (num_latent_tokens_in_the_batch, 2)
+        latent_indices = (input_ids == self.latent_token_id).nonzero()
 
         latent_lists = [
             [idx[1].item() for idx in latent_indices if idx[0] == i]
             for i in range(input_ids.shape[0])
-        ]  # bs, num_latent_tokens_in_the_instance (difference across the batch)
+        ]
 
         max_n_latents = max([len(l) for l in latent_lists])
 
@@ -223,12 +226,10 @@ class Coconut(nn.Module):
 
         if max_n_latents > 0:
             next_compute_range = (0, latent_indices[:, 1].min().item())
-            # before the earliest latent token position
 
         kv_cache = None
 
         for pass_idx in range(max_n_latents):
-
             if kv_cache is None:
                 outputs = self.base_causallm(
                     inputs_embeds=inputs_embeds[
@@ -295,17 +296,17 @@ class Coconut(nn.Module):
                 for batch_idx in range(inputs_embeds.shape[0])
             ]
 
-            for idx_pair in filling_indices:
-                batch_idx, token_idx = idx_pair
+            for batch_idx, token_idx in filling_indices:
                 new_state = hidden_states[
                     batch_idx, token_idx - 1 - hidden_states_offset, :
                 ]
                 if (
-                    graph_residual is not None
+                    kge_embedding is not None
                     and self.latent_injection == "residual"
                     and pass_idx == 0
+                    and bool(has_anchor[batch_idx])
                 ):
-                    new_state = new_state + graph_residual[batch_idx]
+                    new_state = new_state + kge_embedding[batch_idx]
 
                 if analysis_enabled and batch_idx == analysis_batch_index:
                     analysis_trace.setdefault("trajectory", []).append(
@@ -342,12 +343,18 @@ class Coconut(nn.Module):
 
         logits.append(outputs.logits)
 
-        if graph_embedding is not None and self.align_loss_weight > 0:
+        if kge_embedding is not None and self.align_loss_weight > 0:
             pre_decode_hidden = outputs.hidden_states[-1][:, -1, :]
-            norm_proj = F.normalize(graph_embedding, dim=-1)
-            norm_hidden = F.normalize(pre_decode_hidden, dim=-1)
-            align_loss = 1 - F.cosine_similarity(norm_proj, norm_hidden, dim=-1)
-            align_loss = align_loss.mean()
+            valid = has_anchor if has_anchor is not None else torch.zeros(
+                (pre_decode_hidden.shape[0],), dtype=torch.bool, device=pre_decode_hidden.device
+            )
+            if valid.any():
+                norm_proj = F.normalize(kge_embedding[valid], dim=-1)
+                norm_hidden = F.normalize(pre_decode_hidden[valid], dim=-1)
+                align_loss = 1 - F.cosine_similarity(norm_proj, norm_hidden, dim=-1)
+                align_loss = align_loss.mean()
+            else:
+                align_loss = None
         else:
             align_loss = None
 
@@ -369,7 +376,8 @@ class Coconut(nn.Module):
             inputs_embeds=inputs_embeds,
             logits=logits,
             align_loss=align_loss,
-            graph_embedding=graph_embedding,
+            kge_embedding=kge_embedding,
+            anchor_coverage=anchor_coverage,
         )
 
     def train(self):
@@ -381,31 +389,24 @@ class Coconut(nn.Module):
     def generate(
         self,
         input_ids,
-        attention_mask,  # attention_mask is not used
+        attention_mask,
         max_new_tokens=16,
         output_embedding=False,
         synced_gpus=False,
-        graph_x=None,
-        graph_edge_index=None,
-        graph_batch=None,
-        graph_role=None,
+        anchor_entity_ids=None,
+        anchor_token_spans=None,
+        anchor_mask=None,
         analysis_trace: Optional[dict] = None,
         analysis_batch_index: int = 0,
-        **kwargs
+        **kwargs,
     ):
-
         self.gen_forward_cnt = 0
 
         assert input_ids.shape[0] == 1, "only support batch_size == 1 now"
 
-        if self.use_graph and (graph_x is None or graph_edge_index is None or graph_batch is None):
-            raise ValueError(
-                "Graph conditioning requires graph inputs during generation."
-            )
-
         tokens = input_ids[0].detach().tolist()
 
-        labels = input_ids.clone()  # placeholder. not used.
+        labels = input_ids.clone()
         outputs = self.forward(
             input_ids,
             torch.ones_like(input_ids, device=input_ids.device),
@@ -413,16 +414,14 @@ class Coconut(nn.Module):
             torch.arange(
                 0, input_ids.shape[1], dtype=torch.long, device=input_ids.device
             ).reshape(1, -1),
-            graph_x=graph_x,
-            graph_edge_index=graph_edge_index,
-            graph_batch=graph_batch,
-            graph_role=graph_role,
+            anchor_entity_ids=anchor_entity_ids,
+            anchor_token_spans=anchor_token_spans,
+            anchor_mask=anchor_mask,
             analysis_trace=analysis_trace,
             analysis_batch_index=analysis_batch_index,
         )
         inputs_embeds = outputs.inputs_embeds
 
-        # get the first token using the current hidden state
         next_token = torch.argmax(outputs.logits[0, -1]).item()
         tokens.append(next_token)
         new_token_embed = self.embedding(
@@ -430,7 +429,6 @@ class Coconut(nn.Module):
         ).view(1, 1, -1)
         new_inputs_embeds = torch.cat((inputs_embeds, new_token_embed), dim=1)
 
-        # get other tokens
         for _ in range(max_new_tokens - 1):
             outputs = self.base_causallm(inputs_embeds=new_inputs_embeds)
             self.gen_forward_cnt += 1
@@ -444,16 +442,11 @@ class Coconut(nn.Module):
             new_inputs_embeds = torch.cat((new_inputs_embeds, new_token_embed), dim=1)
 
         if synced_gpus:
-            # in FSDP, the number of forward pass need to be the same across devices
-            while (
-                self.gen_forward_cnt < max_new_tokens + MAX_N_LATENT
-            ):  # leave some room for latent tokens
+            while self.gen_forward_cnt < max_new_tokens + MAX_N_LATENT:
                 self.gen_forward_cnt += 1
                 _ = self.base_causallm(inputs_embeds=new_inputs_embeds)
 
         if output_embedding:
-            # for analysis purpose
             return torch.tensor(tokens).view(1, -1), new_inputs_embeds
 
-        else:
-            return torch.tensor(tokens).view(1, -1)
+        return torch.tensor(tokens).view(1, -1)

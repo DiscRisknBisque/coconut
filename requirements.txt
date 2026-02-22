@@ -4,8 +4,4 @@ transformers==4.46.2
 wandb==0.18.7
 datasets==3.1.0
 tqdm==4.67.0
-torch-geometric==2.5.3
-torch-scatter==2.1.2
-torch-sparse==0.6.18
-torch-cluster==1.6.3
-torch-spline-conv==1.2.2
+pykeen==1.11.1

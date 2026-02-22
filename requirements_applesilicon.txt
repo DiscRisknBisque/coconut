@@ -1,7 +1,5 @@
 # Apple Silicon (M1/M2/M3) dependencies for virtualenv installs.
 # Prefer Python 3.11 for the broadest binary wheel availability.
-# PyG extension wheels are version-specific to torch.
---find-links https://data.pyg.org/whl/torch-2.5.1+cpu.html
 
 torch==2.5.1
 numpy==2.1.3
@@ -10,12 +8,7 @@ wandb==0.18.7
 datasets==3.1.0
 tqdm==4.67.0
 PyYAML==6.0.2
-
-torch-geometric==2.5.3
-torch-scatter==2.1.2
-torch-sparse==0.6.18
-torch-cluster==1.6.3
-torch-spline-conv==1.2.2
+pykeen==1.11.1
 
 # Needed for latent cartography utilities in /analysis.
 scikit-learn==1.5.2

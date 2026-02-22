@@ -2,7 +2,7 @@
 
 project: coconut
 save_path: models
-name: prontoqa-coconut-gnn
+name: prosqa-coconut-rotate
 
 only_eval: False
 
@@ -23,8 +23,8 @@ load_model_path: None
 seed: 0
 resume: 0
 bf16: False
-train_path: data/prontoqa_train.json
-val_path: data/prontoqa_valid.json
+train_path: data/prosqa_train.json
+val_path: data/prosqa_valid.json
 reset_optimizer: True
 batch_size_training: 32
 debug: False
@@ -33,16 +33,16 @@ num_epochs: 50
 lr: !!float "1e-4"
 weight_decay: 0.01
 
-use_graph: True
-graph_encoder: gcn2
-graph_dim: 256
-graph_hidden_dim: 256
-graph_input_dim: 259
-graph_prefix_len: 4
+use_kge: True
+kge_artifact_root: data/prosqa_rotate
+kge_entity_embeddings_file: entity_embeddings.pt
+kge_relation_embeddings_file: relation_embeddings.pt
+kge_entity_to_id_file: entity_to_id.json
+kge_metadata_file: metadata.json
+kge_anchor_policy: query_anchors
+kge_projector_hidden: 768
+kge_projector_activation: gelu
+kge_projector_layernorm: True
 align_loss_weight: 0.05
 latent_injection: residual
-graph_sidecar_root: data/prontoqa_graphs
-graph_dropout: 0.1
-graph_projector_hidden: 256
-graph_projector_dropout: 0.1
-graph_prefix_dropout: 0.1
+freeze_base_llm: True

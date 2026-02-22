@@ -21,7 +21,7 @@ conda activate coconut
 pip install -r requirements.txt
 ```
 
-> **Note:** PyTorch Geometric wheels are version-specific. If the installation above fails, grab the matching CUDA/CPU wheels from the [official guide](https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html#installation-via-pip) before re-running the `pip install -r requirements.txt` step.
+> **Note:** RotatE training uses [PyKEEN](https://github.com/pykeen/pykeen). Use Python 3.11+ and install dependencies from `requirements.txt` before running the offline KGE scripts.
 
 The code relies on [wandb](https://wandb.ai/site/) for logging. Please log in your wandb account following this [document](https://docs.wandb.ai/ref/cli/wandb-login/) before running any experiments.
 
@@ -48,53 +48,32 @@ For example, you can download and process the [GSM8K](https://arxiv.org/abs/2110
 bash preprocessing/gsm_icot.bash
 ```
 
-## Graph Conditioning
+## RotatE KGE Pipeline (ProsQA)
 
-To enable the GNN-based graph conditioning, construct lexical subgraph sidecars for each dataset split. The scripts will hash sentence features, build lexical-overlap edges, and emit manifest files that Coconut loads at runtime.
-
-### ProntoQA subgraphs
+This repo uses an offline PyKEEN RotatE pipeline for graph conditioning. Export triples first, then train RotatE, then train Coconut with the KGE projector config.
 
 ```bash
-python preprocessing/graphify_prontoqa.py \
-  --input data/prontoqa_train.json \
-  --split train \
-  --output data/prontoqa_graphs/train
+python preprocessing/export_prosqa_triples.py \
+  --input-dir data \
+  --output-dir data/prosqa_rotate
 
-python preprocessing/graphify_prontoqa.py \
-  --input data/prontoqa_valid.json \
-  --split valid \
-  --output data/prontoqa_graphs/valid
-
-python preprocessing/graphify_prontoqa.py \
-  --input data/prontoqa_test.json \
-  --split test \
-  --output data/prontoqa_graphs/test
+python preprocessing/train_rotate_pykeen.py \
+  --triples-dir data/prosqa_rotate \
+  --output-dir data/prosqa_rotate \
+  --embedding-dim 256
 ```
 
-### ProsQA subgraphs
+Artifacts expected by runtime are written under `data/prosqa_rotate/`:
 
-```bash
-python preprocessing/graphify_prosqa.py \
-  --input data/prosqa_train.json \
-  --split train \
-  --output data/prosqa_graphs/train
-
-python preprocessing/graphify_prosqa.py \
-  --input data/prosqa_valid.json \
-  --split valid \
-  --output data/prosqa_graphs/valid
-
-python preprocessing/graphify_prosqa.py \
-  --input data/prosqa_test.json \
-  --split test \
-  --output data/prosqa_graphs/test
-```
-
-Each command writes per-example tensors to `*.pt` files and a `manifest_<split>.json` file inside the target directory. Ensure `graph_sidecar_root` in your YAML configuration points at the parent directory (for example, `data/prontoqa_graphs`).
+- `entity_embeddings.pt`
+- `relation_embeddings.pt`
+- `entity_to_id.json`
+- `relation_to_id.json`
+- `metadata.json`
 
 ## Latent Cartographer (ProsQA)
 
-`analysis/latent_cartographer.py` decodes Coconut's latent trajectory into nearest graph nodes and writes map/path artifacts for one ProsQA sample.
+`analysis/latent_cartographer.py` decodes Coconut's latent trajectory into nearest projected KGE symbols and writes map/path artifacts for one ProsQA sample.
 
 Install analysis dependencies:
 
@@ -106,9 +85,9 @@ Run cartography on one validation sample:
 
 ```bash
 python analysis/latent_cartographer.py \
-  --config args/prosqa_coconut_gnn.yaml \
+  --config args/prosqa_coconut_rotate.yaml \
   --checkpoint models/checkpoint_49 \
-  --split valid \
+  --split test \
   --sample-idx 1 \
   --metric cosine \
   --output-dir analysis_outputs \
@@ -161,6 +140,20 @@ The configuration of a run should be specified in a yaml file (an example can be
   - **num_epochs**: Maximum training epoches.
   - **lr**: Learning rate
   - **weight_decay**: Weight decay
+
+- **KGE settings**
+  - **use_kge**: Enable RotatE-conditioned Coconut path.
+  - **kge_artifact_root**: Directory containing exported KGE artifacts.
+  - **kge_entity_embeddings_file**: Entity embedding tensor filename under `kge_artifact_root`.
+  - **kge_entity_to_id_file**: Entity-id mapping filename under `kge_artifact_root`.
+  - **kge_metadata_file**: Metadata filename with `projector_in_dim`.
+  - **kge_anchor_policy**: Anchor strategy. Current implementation supports `query_anchors`.
+  - **kge_projector_hidden**: Hidden size for the KGE projector MLP.
+  - **kge_projector_activation**: Projector activation (`gelu`, `relu`, `none`).
+  - **kge_projector_layernorm**: Whether to apply LayerNorm after projector output.
+  - **latent_injection**: Latent residual policy (`residual`, `none`).
+  - **align_loss_weight**: Weight of cosine alignment loss.
+  - **freeze_base_llm**: Freeze base LLM weights and train only KGE-conditioning modules.
 
 ## Training
 
@@ -223,10 +216,10 @@ Then run the following to train the model:
 torchrun --nnodes 1 --nproc_per_node 4 run.py args/prontoqa_coconut.yaml
 ```
 
-To enable graph conditioning, point to the cached subgraphs via the GNN configuration:
+ProntoQA currently uses the baseline Coconut config:
 
 ```bash
-torchrun --nnodes 1 --nproc_per_node 4 run.py args/prontoqa_coconut_gnn.yaml
+torchrun --nnodes 1 --nproc_per_node 4 run.py args/prontoqa_coconut.yaml
 ```
 
 Find the checkpoint with best validation accuracy, and put the path as `load_model_path` in [args/prosqa_coconut_eval.yaml](args/prosqa_coconut_eval.yaml). To evaluate:
@@ -245,10 +238,10 @@ Then run the following to train the model:
 torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_coconut.yaml
 ```
 
-Run the GNN-enhanced variant with:
+Run the RotatE-conditioned variant with:
 
 ```bash
-torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_coconut_gnn.yaml
+torchrun --nnodes 1 --nproc_per_node 4 run.py args/prosqa_coconut_rotate.yaml
 ```
 
 Find the checkpoint with best validation accuracy, and put the path as `load_model_path` in [args/prosqa_coconut_eval.yaml](args/prosqa_coconut_eval.yaml). To evaluate:

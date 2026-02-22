@@ -1,4 +1,4 @@
-"""ProsQA-only CLI for latent cartography over Coconut+GNN trajectories."""
+"""ProsQA-only CLI for latent cartography over Coconut+KGE trajectories."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import torch
 import yaml
@@ -16,10 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from coconut import Coconut
-from preprocessing.prosqa_nodes import extract_prosqa_nodes
-
-from analysis.cartography_utils import (
+from analysis.cartography_utils import (  # noqa: E402
     build_diagnostics,
     compute_metrics,
     decode_trajectory,
@@ -28,6 +25,8 @@ from analysis.cartography_utils import (
     project_embeddings_with_metadata,
     save_json,
 )
+from coconut import Coconut  # noqa: E402
+from kge_utils import build_anchor_payload, load_entity_to_id  # noqa: E402
 
 
 def _normalize_state_dict_keys(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -72,22 +71,24 @@ def _resolve_split_path(configs, split: str) -> Path:
     raise ValueError("split must be one of: train, valid, test")
 
 
-def _build_graph_config(configs: Dict) -> Dict:
-    graph_dim = configs.get("graph_dim", 256)
-    graph_dropout = configs.get("graph_dropout", 0.1)
+def _build_kge_config(configs: Dict) -> Dict:
     return {
-        "use_graph": bool(configs.get("use_graph", True)),
-        "graph_encoder": configs.get("graph_encoder", "gcn2"),
-        "graph_dim": graph_dim,
-        "graph_prefix_len": configs.get("graph_prefix_len", 4),
+        "use_kge": bool(configs.get("use_kge", True)),
+        "kge_artifact_root": configs.get("kge_artifact_root"),
+        "kge_entity_embeddings_file": configs.get(
+            "kge_entity_embeddings_file", "entity_embeddings.pt"
+        ),
+        "kge_relation_embeddings_file": configs.get(
+            "kge_relation_embeddings_file", "relation_embeddings.pt"
+        ),
+        "kge_entity_to_id_file": configs.get("kge_entity_to_id_file", "entity_to_id.json"),
+        "kge_metadata_file": configs.get("kge_metadata_file", "metadata.json"),
+        "kge_anchor_policy": configs.get("kge_anchor_policy", "query_anchors"),
+        "kge_projector_hidden": configs.get("kge_projector_hidden"),
+        "kge_projector_activation": configs.get("kge_projector_activation", "gelu"),
+        "kge_projector_layernorm": configs.get("kge_projector_layernorm", True),
         "align_loss_weight": configs.get("align_loss_weight", 0.0),
         "latent_injection": configs.get("latent_injection", "residual"),
-        "graph_dropout": graph_dropout,
-        "graph_projector_hidden": configs.get("graph_projector_hidden", graph_dim),
-        "graph_projector_dropout": configs.get("graph_projector_dropout", graph_dropout),
-        "graph_prefix_dropout": configs.get("graph_prefix_dropout", graph_dropout),
-        "graph_hidden_dim": configs.get("graph_hidden_dim", graph_dim),
-        "graph_input_dim": configs.get("graph_input_dim", 259),
     }
 
 
@@ -103,16 +104,49 @@ def _load_sample(split_path: Path, sample_idx: int) -> Dict:
     return sample
 
 
-def _load_graph_sidecar(graph_sidecar_root: Path, split: str, sample_idx: int) -> Dict[str, torch.Tensor]:
-    manifest_path = graph_sidecar_root / split / f"manifest_{split}.json"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Missing manifest: {manifest_path}")
-    with manifest_path.open() as f:
-        manifest = json.load(f)
-    graph_path = manifest.get(str(sample_idx))
-    if graph_path is None:
-        raise KeyError(f"Sample idx={sample_idx} missing from manifest {manifest_path}")
-    return torch.load(graph_path, map_location="cpu")
+def _project_sample_nodes(
+    model: Coconut,
+    sample: Dict,
+    entity_to_id: Dict[str, int],
+    device: torch.device,
+) -> Tuple[torch.Tensor, List[str], torch.Tensor]:
+    symbols = sample.get("idx_to_symbol") or []
+    kept_labels: List[str] = []
+    kept_entity_ids: List[int] = []
+    old_to_new: Dict[int, int] = {}
+
+    for idx, symbol in enumerate(symbols):
+        entity_id = entity_to_id.get(symbol)
+        if entity_id is None:
+            entity_id = entity_to_id.get(str(symbol).lower())
+        if entity_id is None:
+            continue
+        old_to_new[idx] = len(kept_labels)
+        kept_labels.append(str(symbol))
+        kept_entity_ids.append(int(entity_id))
+
+    if not kept_entity_ids:
+        raise RuntimeError("No sample symbols mapped into entity_to_id; cannot build cartography.")
+
+    entity_ids_tensor = torch.tensor(kept_entity_ids, dtype=torch.long, device=device)
+    with torch.no_grad():
+        node_embeddings = model.project_entity_ids(entity_ids_tensor).detach().cpu()
+
+    edges = sample.get("edges", []) or []
+    remapped_edges = []
+    for edge in edges:
+        if not isinstance(edge, (list, tuple)) or len(edge) != 2:
+            continue
+        src, dst = int(edge[0]), int(edge[1])
+        if src in old_to_new and dst in old_to_new:
+            remapped_edges.append((old_to_new[src], old_to_new[dst]))
+
+    if remapped_edges:
+        edge_index = torch.tensor(remapped_edges, dtype=torch.long).t().contiguous()
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+
+    return node_embeddings, kept_labels, edge_index
 
 
 def main():
@@ -163,13 +197,17 @@ def main():
     with open(args.config) as f:
         configs = yaml.safe_load(f)
 
-    graph_sidecar_root = configs.get("graph_sidecar_root")
-    if not graph_sidecar_root:
-        raise ValueError("graph_sidecar_root must be set in config for cartography")
+    kge_artifact_root = configs.get("kge_artifact_root")
+    if not kge_artifact_root:
+        raise ValueError("kge_artifact_root must be set in config for cartography")
+
+    entity_to_id_path = Path(kge_artifact_root) / configs.get(
+        "kge_entity_to_id_file", "entity_to_id.json"
+    )
+    entity_to_id = load_entity_to_id(entity_to_id_path)
 
     split_path = _resolve_split_path(configs, args.split)
     sample = _load_sample(split_path, args.sample_idx)
-    graph_data = _load_graph_sidecar(Path(graph_sidecar_root), args.split, args.sample_idx)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(configs["model_id"])
@@ -189,8 +227,8 @@ def main():
         embeddings.weight.data[token_id] = embeddings.weight.data[target_id]
         base_model.lm_head.weight.data[token_id] = base_model.lm_head.weight.data[target_id]
 
-    graph_config = _build_graph_config(configs)
-    graph_config["use_graph"] = True
+    kge_config = _build_kge_config(configs)
+    kge_config["use_kge"] = True
     model = Coconut(
         base_model,
         latent_id,
@@ -198,32 +236,38 @@ def main():
         end_id,
         tokenizer.eos_token_id,
         tokenizer.pad_token_id,
-        graph_config=graph_config,
+        kge_config=kge_config,
     )
     _load_weights(base_model, model, Path(args.checkpoint))
     model = model.to(device)
     model.eval()
 
     scheduled_stage = (
-        args.scheduled_stage if args.scheduled_stage is not None else configs.get("max_latent_stage", 6)
+        args.scheduled_stage
+        if args.scheduled_stage is not None
+        else configs.get("max_latent_stage", 6)
     )
     c_thought = int(configs.get("c_thought", 1))
     max_latent_stage = int(configs.get("max_latent_stage", 6))
     n_steps = len(sample.get("steps", []))
     n_latent_tokens = min(scheduled_stage, min(max_latent_stage, n_steps)) * c_thought
 
-    question_tokens = tokenizer.encode(sample["question"] + "\n", add_special_tokens=True)
+    question_text = sample["question"] + "\n"
+    question_tokens = tokenizer.encode(question_text, add_special_tokens=True)
     input_tokens = question_tokens + [start_id] + [latent_id] * n_latent_tokens + [end_id]
     input_ids = torch.tensor([input_tokens], dtype=torch.long, device=device)
     attention_mask = torch.ones_like(input_ids, device=device)
 
-    graph_x = graph_data["x"].float().to(device)
-    graph_edge_index = graph_data["edge_index"].long().to(device)
-    graph_role = graph_data.get("role")
-    if graph_role is None:
-        graph_role = torch.zeros((graph_x.shape[0],), dtype=torch.long)
-    graph_role = graph_role.long().to(device)
-    graph_batch = torch.zeros((graph_x.shape[0],), dtype=torch.long, device=device)
+    anchor_entity_ids, anchor_token_spans, anchor_mask = build_anchor_payload(
+        sample=sample,
+        tokenizer=tokenizer,
+        question_text=question_text,
+        question_tokenized=question_tokens,
+        entity_to_id=entity_to_id,
+    )
+    anchor_entity_ids = torch.tensor([anchor_entity_ids], dtype=torch.long, device=device)
+    anchor_token_spans = torch.tensor([anchor_token_spans], dtype=torch.long, device=device)
+    anchor_mask = torch.tensor([anchor_mask], dtype=torch.bool, device=device)
 
     analysis_trace: Dict = {}
     with torch.no_grad():
@@ -231,29 +275,26 @@ def main():
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_new_tokens=args.max_new_tokens,
-            graph_x=graph_x,
-            graph_edge_index=graph_edge_index,
-            graph_batch=graph_batch,
-            graph_role=graph_role,
+            anchor_entity_ids=anchor_entity_ids,
+            anchor_token_spans=anchor_token_spans,
+            anchor_mask=anchor_mask,
             analysis_trace=analysis_trace,
             analysis_batch_index=0,
         )
-
-    node_embeddings = analysis_trace.get("node_embeddings")
-    if node_embeddings is None:
-        raise RuntimeError("analysis_trace did not contain node_embeddings")
 
     trajectory_list = analysis_trace.get("trajectory", [])
     if trajectory_list:
         trajectory = torch.stack(trajectory_list, dim=0)
     else:
-        trajectory = torch.empty((0, node_embeddings.shape[1]), dtype=node_embeddings.dtype)
+        hidden = model.embedding.embedding_dim
+        trajectory = torch.empty((0, hidden), dtype=torch.float32)
 
-    edges_local = analysis_trace.get("edge_index", torch.empty((2, 0), dtype=torch.long))
-    entries, _ = extract_prosqa_nodes(sample)
-    node_labels = [f"{role}:{text}" for role, text in entries]
-    if len(node_labels) != node_embeddings.shape[0]:
-        node_labels = [f"node_{i}" for i in range(node_embeddings.shape[0])]
+    node_embeddings, node_labels, edges_local = _project_sample_nodes(
+        model=model,
+        sample=sample,
+        entity_to_id=entity_to_id,
+        device=device,
+    )
 
     if trajectory.shape[0] > 0:
         decoded_path, score_matrix = decode_trajectory(
@@ -263,12 +304,12 @@ def main():
             metric=args.metric,
             stability_threshold=args.stability_threshold,
         )
+        decoded_indices = [entry["predicted_node_index"] for entry in decoded_path]
+        metrics = compute_metrics(decoded_indices, edges_local)
     else:
         decoded_path = []
         score_matrix = torch.empty((0, node_embeddings.shape[0]))
-
-    decoded_indices = [entry["predicted_node_index"] for entry in decoded_path]
-    metrics = compute_metrics(decoded_indices, edges_local)
+        metrics = compute_metrics([], edges_local)
 
     raw_nodes_2d, raw_path_2d, raw_projection_meta = project_embeddings_with_metadata(
         node_embeddings=node_embeddings,
@@ -281,106 +322,7 @@ def main():
         projection_mode="l2_normalized",
     )
 
-    if args.projection_mode == "raw":
-        nodes_2d, path_2d = raw_nodes_2d, raw_path_2d
-        selected_projection_meta = raw_projection_meta
-    else:
-        nodes_2d, path_2d = norm_nodes_2d, norm_path_2d
-        selected_projection_meta = norm_projection_meta
-
-    if trajectory.shape[0] > 0:
-        metric_decoded_path, _ = decode_trajectory(
-            trajectory=trajectory,
-            node_embeddings=node_embeddings,
-            node_labels=node_labels,
-            metric=args.distance_metric,
-            stability_threshold=args.stability_threshold,
-        )
-        nearest_node_indices = [entry["predicted_node_index"] for entry in metric_decoded_path]
-    else:
-        nearest_node_indices = []
-
-    if trajectory.shape[0] > 0:
-        cosine_path, _ = decode_trajectory(
-            trajectory=trajectory,
-            node_embeddings=node_embeddings,
-            node_labels=node_labels,
-            metric="cosine",
-            stability_threshold=args.stability_threshold,
-        )
-        mean_cosine_conf = float(
-            sum([entry["confidence"] for entry in cosine_path]) / max(len(cosine_path), 1)
-        )
-    else:
-        mean_cosine_conf = 0.0
-
-    raw_node_radius_mean = float(raw_projection_meta["node_radius_stats"]["mean"])
-    raw_traj_radius_mean = float(raw_projection_meta["trajectory_radius_stats"]["mean"])
-    radius_ratio = raw_traj_radius_mean / max(raw_node_radius_mean, 1e-8)
-    summary_text = (
-        f"latent_tokens={n_latent_tokens}\n"
-        f"mean_cos_conf={mean_cosine_conf:.3f}\n"
-        f"raw_radius_ratio={radius_ratio:.2f}"
-    )
-
-    output_dir = Path(args.output_dir) / f"{args.split}_{args.sample_idx}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    png_path = output_dir / "cartography.png"
-    dual_png_path = output_dir / "cartography_dual.png"
-    gif_path = output_dir / "cartography.gif" if args.save_gif else None
-
-    # Keep cartography.png as the legacy raw-space rendering for backward compatibility.
-    plot_cartography(
-        nodes_2d=raw_nodes_2d,
-        path_2d=raw_path_2d,
-        node_labels=node_labels,
-        edge_index=edges_local,
-        out_png=png_path,
-        out_gif=gif_path,
-        nearest_node_indices=nearest_node_indices,
-        summary_text=summary_text,
-    )
-
-    torch.save(node_embeddings, output_dir / "node_embeddings.pt")
-    torch.save(trajectory, output_dir / "reasoning_trajectory.pt")
-    torch.save(score_matrix, output_dir / "similarity.pt")
-
-    if args.plot_layout == "dual":
-        plot_cartography_dual(
-            raw_nodes_2d=raw_nodes_2d,
-            raw_path_2d=raw_path_2d,
-            norm_nodes_2d=norm_nodes_2d,
-            norm_path_2d=norm_path_2d,
-            node_labels=node_labels,
-            edge_index=edges_local,
-            out_png=dual_png_path,
-            nearest_node_indices=nearest_node_indices,
-            summary_text=summary_text,
-        )
-    elif args.projection_mode != "raw":
-        # In single mode, respect selected projection mode by overwriting cartography.png.
-        plot_cartography(
-            nodes_2d=nodes_2d,
-            path_2d=path_2d,
-            node_labels=node_labels,
-            edge_index=edges_local,
-            out_png=png_path,
-            out_gif=gif_path,
-            nearest_node_indices=nearest_node_indices,
-            summary_text=summary_text,
-        )
-
-    save_json(
-        {
-            "decoded_path": decoded_path,
-            "metric": args.metric,
-            "stability_threshold": args.stability_threshold,
-            "sample_idx": args.sample_idx,
-            "split": args.split,
-        },
-        output_dir / "decoded_path.json",
-    )
-    save_json(metrics, output_dir / "metrics.json")
+    diagnostics = None
     if args.diagnostics_json:
         diagnostics = build_diagnostics(
             node_embeddings=node_embeddings,
@@ -389,33 +331,85 @@ def main():
             raw_projection_meta=raw_projection_meta,
             normalized_projection_meta=norm_projection_meta,
         )
-        diagnostics["selected_projection_mode"] = args.projection_mode
-        diagnostics["selected_projection_metadata"] = selected_projection_meta
-        diagnostics["distance_metric_for_annotations"] = args.distance_metric
-        save_json(diagnostics, output_dir / "diagnostics.json")
 
-        cosine_assignments = diagnostics["nearest_assignments"]["cosine"]
-        mean_cosine_score = (
-            sum(item["score"] for item in cosine_assignments) / max(len(cosine_assignments), 1)
-            if cosine_assignments
-            else 0.0
+    output_dir = Path(args.output_dir) / f"{args.split}_{args.sample_idx}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    title = (
+        f"ProsQA KGE Cartography\n"
+        f"split={args.split} idx={args.sample_idx} metric={args.metric} "
+        f"latent_tokens={n_latent_tokens}\n"
+        f"Q: {sample['question'][:140]}"
+    )
+
+    png_path = output_dir / "cartography.png"
+    dual_png_path = output_dir / "cartography_dual.png"
+    gif_path = output_dir / "cartography.gif" if args.save_gif else None
+
+    plot_cartography(
+        nodes_2d=raw_nodes_2d,
+        path_2d=raw_path_2d,
+        node_labels=node_labels,
+        decoded_path=decoded_path,
+        edge_index=edges_local,
+        title=title,
+        png_path=png_path,
+        gif_path=gif_path,
+        distance_metric=args.distance_metric,
+    )
+
+    torch.save(node_embeddings, output_dir / "node_embeddings.pt")
+    torch.save(trajectory, output_dir / "reasoning_trajectory.pt")
+    torch.save(score_matrix, output_dir / "similarity.pt")
+    save_json(output_dir / "decoded_path.json", decoded_path)
+    save_json(output_dir / "metrics.json", metrics)
+
+    if args.plot_layout == "dual":
+        plot_cartography_dual(
+            raw_nodes_2d=raw_nodes_2d,
+            raw_path_2d=raw_path_2d,
+            norm_nodes_2d=norm_nodes_2d,
+            norm_path_2d=norm_path_2d,
+            node_labels=node_labels,
+            decoded_path=decoded_path,
+            edge_index=edges_local,
+            title=title,
+            png_path=dual_png_path,
+            distance_metric=args.distance_metric,
         )
-        artifact_hint = (
-            "possible projection artifact"
-            if mean_cosine_score > 0.8 and radius_ratio > 3.0
-            else "trajectory scale appears consistent"
+    else:
+        selected_nodes = raw_nodes_2d if args.projection_mode == "raw" else norm_nodes_2d
+        selected_path = raw_path_2d if args.projection_mode == "raw" else norm_path_2d
+        plot_cartography(
+            nodes_2d=selected_nodes,
+            path_2d=selected_path,
+            node_labels=node_labels,
+            decoded_path=decoded_path,
+            edge_index=edges_local,
+            title=title,
+            png_path=png_path,
+            gif_path=gif_path,
+            distance_metric=args.distance_metric,
         )
-        print(
-            "Cartography diagnostic: "
-            f"mean_cosine_score={mean_cosine_score:.3f}, "
-            f"radius_ratio={radius_ratio:.2f} -> {artifact_hint}"
-        )
+
+    if diagnostics is not None:
+        save_json(output_dir / "diagnostics.json", diagnostics)
+
     save_json(
+        output_dir / "run_config.json",
         {
+            "split": args.split,
+            "sample_idx": args.sample_idx,
+            "scheduled_stage": int(scheduled_stage),
+            "n_latent_tokens": n_latent_tokens,
+            "metric": args.metric,
+            "projection_mode": args.projection_mode,
+            "plot_layout": args.plot_layout,
+            "distance_metric": args.distance_metric,
+            "max_new_tokens": args.max_new_tokens,
+            "stability_threshold": args.stability_threshold,
             "generated_text": tokenizer.decode(outputs[0], skip_special_tokens=True),
-            "num_latent_tokens": n_latent_tokens,
         },
-        output_dir / "generation.json",
     )
 
     print(f"Saved latent cartography outputs under: {output_dir}")
