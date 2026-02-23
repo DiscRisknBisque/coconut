@@ -257,7 +257,12 @@ def main():
             parallel_model = DDP(model, device_ids=[local_rank])
         else:
             parallel_model = FSDP(
-                model, auto_wrap_policy=llama_auto_wrap_policy, device_id=device
+                model,
+                auto_wrap_policy=llama_auto_wrap_policy,
+                device_id=device,
+                # KGE mode freezes base LLM params while keeping projector params trainable.
+                # Without use_orig_params, FSDP requires uniform requires_grad within each flattened handle.
+                use_orig_params=True,
             )
     else:
         parallel_model = DDP(model)
