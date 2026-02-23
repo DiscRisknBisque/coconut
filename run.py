@@ -22,6 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 import torch.distributed as dist
+from torch.distributed.elastic.multiprocessing.errors import record
 from coconut import Coconut
 from dataset import MyCollator, get_cot_latent_dataset, get_dataset, get_question_latent_dataset
 from utils import Config, set_seed
@@ -64,6 +65,7 @@ def _resolve_distributed_env(local_rank: int):
     return backend, device
 
 
+@record
 def main():
     parser = argparse.ArgumentParser(description="coconut")
     parser.add_argument("config_file")
