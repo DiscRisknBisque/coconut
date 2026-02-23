@@ -7,6 +7,7 @@ import gc
 import json
 import os
 import sys
+from contextlib import nullcontext
 
 import torch
 import torch.distributed
@@ -551,11 +552,17 @@ def main():
 
                 total += 1
 
-                outputs = parallel_model.module.generate(
-                    **batch,
-                    max_new_tokens=max_new_tokens,
-                    synced_gpus=not configs.only_eval,
+                gen_ctx = (
+                    FSDP.summon_full_params(parallel_model, writeback=False, recurse=True)
+                    if torch.cuda.is_available() and not configs.only_eval
+                    else nullcontext()
                 )
+                with gen_ctx:
+                    outputs = parallel_model.module.generate(
+                        **batch,
+                        max_new_tokens=max_new_tokens,
+                        synced_gpus=not configs.only_eval,
+                    )
 
                 text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
                 answer_output = text_output.split("#")[-1].replace(",", "").strip()
