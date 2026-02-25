@@ -5,6 +5,7 @@ import argparse
 import functools
 import gc
 import json
+import math
 import os
 import sys
 from contextlib import nullcontext
@@ -12,6 +13,7 @@ from contextlib import nullcontext
 import torch
 import torch.distributed
 import torch.optim as optim
+import torch.nn.utils as nn_utils
 import wandb
 import yaml
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -19,7 +21,7 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 import torch.distributed as dist
@@ -49,6 +51,60 @@ def _freeze_base_llm_if_configured(model, configs) -> int:
 
 def _trainable_parameters(module):
     return [p for p in module.parameters() if p.requires_grad]
+
+
+def _optimizer_update_steps(num_batches: int, gradient_accumulation_steps: int) -> int:
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be > 0")
+    if num_batches <= 0:
+        return 0
+    return math.ceil(num_batches / gradient_accumulation_steps)
+
+
+def _remaining_epochs_in_current_stage(
+    *,
+    epoch: int,
+    num_epochs: int,
+    epochs_per_stage: int,
+    single_stage_schedule: bool,
+) -> int:
+    if epoch >= num_epochs:
+        return 0
+    if single_stage_schedule:
+        return num_epochs - epoch
+    if epochs_per_stage <= 0:
+        raise ValueError("epochs_per_stage must be > 0 when using staged training")
+    stage_idx = epoch // epochs_per_stage
+    stage_end_epoch = min(num_epochs, (stage_idx + 1) * epochs_per_stage)
+    return max(stage_end_epoch - epoch, 0)
+
+
+def _scheduler_step_counts(
+    *,
+    num_batches: int,
+    gradient_accumulation_steps: int,
+    epoch: int,
+    num_epochs: int,
+    reset_optimizer: bool,
+    epochs_per_stage: int,
+    single_stage_schedule: bool,
+    lr_warmup_ratio: float,
+):
+    updates_per_epoch = _optimizer_update_steps(num_batches, gradient_accumulation_steps)
+    if reset_optimizer:
+        remaining_epochs = _remaining_epochs_in_current_stage(
+            epoch=epoch,
+            num_epochs=num_epochs,
+            epochs_per_stage=epochs_per_stage,
+            single_stage_schedule=single_stage_schedule,
+        )
+    else:
+        remaining_epochs = max(num_epochs - epoch, 0)
+
+    total_steps = max(updates_per_epoch * remaining_epochs, 0)
+    warmup_ratio = min(max(float(lr_warmup_ratio), 0.0), 1.0)
+    warmup_steps = min(max(int(total_steps * warmup_ratio), 0), total_steps)
+    return updates_per_epoch, total_steps, warmup_steps
 
 
 def _resolve_distributed_env(local_rank: int):
@@ -97,6 +153,7 @@ def main():
         "kge_metadata_file": "metadata.json",
         "kge_anchor_policy": "query_anchors",
         "kge_projector_hidden": None,
+        "kge_projector_num_hidden_layers": 1,
         "kge_projector_activation": "gelu",
         "kge_projector_layernorm": True,
         "align_loss_weight": 0.0,
@@ -105,6 +162,15 @@ def main():
     }
 
     for key, value in default_kge_config.items():
+        if not hasattr(configs, key):
+            setattr(configs, key, value)
+
+    default_train_stability_config = {
+        "lr_scheduler": "none",
+        "lr_warmup_ratio": 0.0,
+        "max_grad_norm": None,
+    }
+    for key, value in default_train_stability_config.items():
         if not hasattr(configs, key):
             setattr(configs, key, value)
 
@@ -177,6 +243,7 @@ def main():
         "kge_metadata_file": configs.kge_metadata_file,
         "kge_anchor_policy": configs.kge_anchor_policy,
         "kge_projector_hidden": configs.kge_projector_hidden,
+        "kge_projector_num_hidden_layers": configs.kge_projector_num_hidden_layers,
         "kge_projector_activation": configs.kge_projector_activation,
         "kge_projector_layernorm": configs.kge_projector_layernorm,
         "align_loss_weight": configs.align_loss_weight,
@@ -316,15 +383,8 @@ def main():
         wandb_run = None
 
     optimizer = None
-    if not configs.reset_optimizer:
-        trainable = _trainable_parameters(parallel_model)
-        if len(trainable) == 0:
-            raise RuntimeError("No trainable parameters found for optimizer initialization")
-        optimizer = optim.AdamW(
-            trainable,
-            lr=configs.lr,
-            weight_decay=configs.weight_decay,
-        )
+    scheduler = None
+    optimizer_stage = None
 
     best_acc = 0
 
@@ -400,24 +460,64 @@ def main():
                 sampler=DistributedSampler(dataset_loss_val, shuffle=False),
             )
 
-            if configs.reset_optimizer:
-                if optimizer is not None:
-                    del optimizer
-
+            should_reset_optimizer = optimizer is None or (
+                configs.reset_optimizer and optimizer_stage != scheduled_stage
+            )
+            if should_reset_optimizer:
                 trainable = _trainable_parameters(parallel_model)
                 if len(trainable) == 0:
                     raise RuntimeError(
-                        "No trainable parameters found when resetting optimizer"
+                        "No trainable parameters found for optimizer initialization"
                     )
                 optimizer = optim.AdamW(
                     trainable,
                     lr=configs.lr,
                     weight_decay=configs.weight_decay,
                 )
+                optimizer_stage = scheduled_stage
+                scheduler = None
+
+                scheduler_name = str(getattr(configs, "lr_scheduler", "none")).lower()
+                if scheduler_name not in {"none", "cosine"}:
+                    raise ValueError(
+                        f"Unsupported lr_scheduler='{configs.lr_scheduler}'. Expected 'none' or 'cosine'."
+                    )
+                if scheduler_name == "cosine":
+                    updates_per_epoch, total_scheduler_steps, warmup_steps = _scheduler_step_counts(
+                        num_batches=len(train_dataloader),
+                        gradient_accumulation_steps=configs.gradient_accumulation_steps,
+                        epoch=epoch,
+                        num_epochs=configs.num_epochs,
+                        reset_optimizer=bool(configs.reset_optimizer),
+                        epochs_per_stage=configs.epochs_per_stage,
+                        single_stage_schedule=bool(configs.cot or configs.no_cot),
+                        lr_warmup_ratio=configs.lr_warmup_ratio,
+                    )
+                    if total_scheduler_steps > 0:
+                        scheduler = get_cosine_schedule_with_warmup(
+                            optimizer,
+                            num_warmup_steps=warmup_steps,
+                            num_training_steps=total_scheduler_steps,
+                        )
+                    if rank == 0:
+                        print(
+                            "Scheduler initialized:",
+                            {
+                                "type": "cosine",
+                                "epoch": epoch,
+                                "stage": scheduled_stage,
+                                "updates_per_epoch": updates_per_epoch,
+                                "total_steps": total_scheduler_steps,
+                                "warmup_steps": warmup_steps,
+                            },
+                        )
 
             parallel_model.module.train()
 
-            total_length = len(train_dataloader) // configs.gradient_accumulation_steps
+            updates_per_epoch = _optimizer_update_steps(
+                len(train_dataloader), configs.gradient_accumulation_steps
+            )
+            total_length = max(updates_per_epoch, 1)
             pbar = tqdm(
                 colour="blue",
                 desc=f"Training Epoch: {epoch+1}",
@@ -454,10 +554,26 @@ def main():
                 loss = outputs.loss / configs.gradient_accumulation_steps
                 loss.backward()
 
+                grad_norm_to_log = None
                 if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
                     train_dataloader
                 ) - 1:
+                    max_grad_norm = getattr(configs, "max_grad_norm", None)
+                    if max_grad_norm is not None and float(max_grad_norm) > 0:
+                        if hasattr(parallel_model, "clip_grad_norm_"):
+                            grad_norm = parallel_model.clip_grad_norm_(float(max_grad_norm))
+                        else:
+                            grad_norm = nn_utils.clip_grad_norm_(
+                                _trainable_parameters(parallel_model), float(max_grad_norm)
+                            )
+                        if isinstance(grad_norm, torch.Tensor):
+                            grad_norm_to_log = grad_norm.detach().float()
+                        else:
+                            grad_norm_to_log = torch.tensor(float(grad_norm), device=device)
+
                     optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
                     optimizer.zero_grad()
                     pbar.update(1)
 
@@ -476,6 +592,10 @@ def main():
                         )
                     if getattr(outputs, "anchor_coverage", None) is not None:
                         log_dict["train/anchor_coverage"] = outputs.anchor_coverage.detach().float()
+                    if optimizer is not None:
+                        log_dict["train/lr"] = optimizer.param_groups[0]["lr"]
+                    if grad_norm_to_log is not None:
+                        log_dict["train/grad_norm"] = grad_norm_to_log
                     wandb_run.log(log_dict)
 
                 pbar.set_description(

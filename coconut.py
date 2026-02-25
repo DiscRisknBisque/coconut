@@ -91,18 +91,30 @@ class Coconut(nn.Module):
         kge_input_dim = entity_embeddings.shape[1]
 
         projector_hidden = kge_config.get("kge_projector_hidden", hidden_size)
+        num_hidden_layers = int(kge_config.get("kge_projector_num_hidden_layers", 1))
         activation = kge_config.get("kge_projector_activation", "gelu").lower()
         use_layernorm = bool(kge_config.get("kge_projector_layernorm", True))
 
-        layers = [nn.Linear(kge_input_dim, projector_hidden)]
-        if activation == "gelu":
-            layers.append(nn.GELU())
-        elif activation == "relu":
-            layers.append(nn.ReLU())
-        elif activation == "none":
-            pass
-        else:
+        if num_hidden_layers < 1:
+            raise ValueError(
+                f"kge_projector_num_hidden_layers must be >= 1, got {num_hidden_layers}"
+            )
+
+        if activation not in {"gelu", "relu", "none"}:
             raise ValueError(f"Unsupported kge_projector_activation='{activation}'")
+
+        def _append_activation():
+            if activation == "gelu":
+                layers.append(nn.GELU())
+            elif activation == "relu":
+                layers.append(nn.ReLU())
+
+        layers = [nn.Linear(kge_input_dim, projector_hidden)]
+        _append_activation()
+
+        for _ in range(num_hidden_layers - 1):
+            layers.append(nn.Linear(projector_hidden, projector_hidden))
+            _append_activation()
 
         layers.append(nn.Linear(projector_hidden, hidden_size))
         if use_layernorm:

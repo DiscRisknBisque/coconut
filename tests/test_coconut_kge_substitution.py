@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from coconut import Coconut
 
@@ -109,3 +110,71 @@ def test_kge_span_substitution_replaces_anchor_tokens(tmp_path):
     assert torch.allclose(replaced, projected, atol=1e-5)
     assert outputs.kge_embedding is not None
     assert outputs.loss.ndim == 0
+
+
+def test_kge_projector_supports_two_hidden_layers(tmp_path):
+    _write_kge_artifacts(tmp_path)
+    model = Coconut(
+        DummyLM(hidden_size=8),
+        latent_token_id=3,
+        start_latent_id=4,
+        end_latent_id=5,
+        eos_token_id=1,
+        pad_token_id=0,
+        kge_config={
+            "use_kge": True,
+            "kge_artifact_root": str(tmp_path),
+            "kge_entity_embeddings_file": "entity_embeddings.pt",
+            "kge_metadata_file": "metadata.json",
+            "kge_projector_hidden": 10,
+            "kge_projector_num_hidden_layers": 2,
+            "kge_projector_activation": "gelu",
+            "kge_projector_layernorm": True,
+        },
+    )
+
+    linear_layers = [m for m in model.kge_projector if isinstance(m, nn.Linear)]
+    gelu_layers = [m for m in model.kge_projector if isinstance(m, nn.GELU)]
+    assert len(linear_layers) == 3
+    assert len(gelu_layers) == 2
+
+    projected = model.project_entity_ids(torch.tensor([[0, 1]]))
+    assert projected.shape == (1, 2, 8)
+
+    input_ids = torch.tensor([[1, 2, 1]])
+    outputs = model(
+        input_ids,
+        torch.ones_like(input_ids),
+        input_ids.clone(),
+        torch.arange(input_ids.size(1)).unsqueeze(0),
+        anchor_entity_ids=torch.tensor([[0, -1, -1]]),
+        anchor_token_spans=torch.tensor([[[1, 2], [0, 0], [0, 0]]]),
+        anchor_mask=torch.tensor([[True, False, False]]),
+    )
+    assert outputs.loss.ndim == 0
+
+
+def test_kge_projector_default_depth_is_one_hidden_layer(tmp_path):
+    _write_kge_artifacts(tmp_path)
+    model = Coconut(
+        DummyLM(hidden_size=8),
+        latent_token_id=3,
+        start_latent_id=4,
+        end_latent_id=5,
+        eos_token_id=1,
+        pad_token_id=0,
+        kge_config={
+            "use_kge": True,
+            "kge_artifact_root": str(tmp_path),
+            "kge_entity_embeddings_file": "entity_embeddings.pt",
+            "kge_metadata_file": "metadata.json",
+            "kge_projector_hidden": 10,
+            "kge_projector_activation": "gelu",
+            "kge_projector_layernorm": True,
+        },
+    )
+
+    linear_layers = [m for m in model.kge_projector if isinstance(m, nn.Linear)]
+    gelu_layers = [m for m in model.kge_projector if isinstance(m, nn.GELU)]
+    assert len(linear_layers) == 2
+    assert len(gelu_layers) == 1

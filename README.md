@@ -140,6 +140,9 @@ The configuration of a run should be specified in a yaml file (an example can be
   - **num_epochs**: Maximum training epoches.
   - **lr**: Learning rate
   - **weight_decay**: Weight decay
+  - **lr_scheduler**: Learning rate scheduler (`none`, `cosine`).
+  - **lr_warmup_ratio**: Warmup fraction of optimizer-update steps (e.g. `0.1` for 10%).
+  - **max_grad_norm**: Gradient clipping max norm. Disabled when unset/`None`/`<= 0`.
 
 - **KGE settings**
   - **use_kge**: Enable RotatE-conditioned Coconut path.
@@ -149,6 +152,7 @@ The configuration of a run should be specified in a yaml file (an example can be
   - **kge_metadata_file**: Metadata filename with `projector_in_dim`.
   - **kge_anchor_policy**: Anchor strategy. Current implementation supports `query_anchors`.
   - **kge_projector_hidden**: Hidden size for the KGE projector MLP.
+  - **kge_projector_num_hidden_layers**: Number of hidden layers in the KGE projector MLP (default `1`).
   - **kge_projector_activation**: Projector activation (`gelu`, `relu`, `none`).
   - **kge_projector_layernorm**: Whether to apply LayerNorm after projector output.
   - **latent_injection**: Latent residual policy (`residual`, `none`).
@@ -162,6 +166,8 @@ Run the following commands (replacing `N_GPUS` and `PATH_TO_ARGS`):
 ```
 torchrun --nnodes 1 --nproc_per_node N_GPUS run.py PATH_TO_ARGS
 ```
+
+When `lr_scheduler: cosine` is enabled, warmup and cosine decay are computed over optimizer-update steps (not raw dataloader batches), so `gradient_accumulation_steps` is handled correctly.
 
 ## Reproducing Experiments
 
