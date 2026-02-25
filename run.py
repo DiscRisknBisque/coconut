@@ -375,7 +375,7 @@ def main():
     total_train_steps = 0
 
     if not configs.debug and not configs.only_eval and rank == 0:
-        wandb_run = wandb.init(project=configs.project, name=configs.name, id=configs.id if configs.id else None)
+        wandb_run = wandb.init(project=configs.project, name=configs.name, id=configs.id if configs.id else None, resume="allow")
         wandb_run.config.update(configs, allow_val_change=True)
         text_table = wandb.Table(columns=["step", "text"])
 
