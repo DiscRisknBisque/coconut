@@ -183,10 +183,11 @@ class Coconut(nn.Module):
                 replacement = projected[batch_idx, anchor_idx].view(1, hidden_size)
                 inputs_embeds[batch_idx, start:end, :] = replacement
 
-        valid_for_pool = span_valid.unsqueeze(-1).float()
+        valid_for_pool = span_valid.unsqueeze(-1).to(dtype=projected.dtype)
         pooled = (projected * valid_for_pool).sum(dim=1)
         denom = valid_for_pool.sum(dim=1).clamp(min=1.0)
         pooled = pooled / denom
+        pooled = pooled.to(dtype=self.kge_residual_norm.weight.dtype)
         pooled = self.kge_residual_norm(pooled)
         has_anchor = span_valid.any(dim=1)
         return pooled, projected, has_anchor, anchor_coverage
