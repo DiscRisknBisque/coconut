@@ -53,6 +53,116 @@ def _trainable_parameters(module):
     return [p for p in module.parameters() if p.requires_grad]
 
 
+def _validate_lr(value, field_name: str) -> float:
+    lr = float(value)
+    if lr <= 0:
+        raise ValueError(f"{field_name} must be > 0, got {value}")
+    return lr
+
+
+def _resolve_group_lrs(*, lr, lr_base_llm=None, lr_projection_mlp=None):
+    default_lr = _validate_lr(lr, "lr")
+    base_lr = (
+        _validate_lr(lr_base_llm, "lr_base_llm")
+        if lr_base_llm is not None
+        else default_lr
+    )
+    projection_lr = (
+        _validate_lr(lr_projection_mlp, "lr_projection_mlp")
+        if lr_projection_mlp is not None
+        else default_lr
+    )
+    return default_lr, base_lr, projection_lr
+
+
+def _build_optimizer_param_groups(module, *, lr, lr_base_llm=None, lr_projection_mlp=None):
+    trainable_named = [(name, p) for name, p in module.named_parameters() if p.requires_grad]
+    if len(trainable_named) == 0:
+        raise RuntimeError("No trainable parameters found for optimizer initialization")
+
+    default_lr, base_lr, projection_lr = _resolve_group_lrs(
+        lr=lr,
+        lr_base_llm=lr_base_llm,
+        lr_projection_mlp=lr_projection_mlp,
+    )
+    use_split_lrs = lr_base_llm is not None or lr_projection_mlp is not None
+
+    if not use_split_lrs:
+        return (
+            [{"name": "all", "params": [p for _, p in trainable_named], "lr": default_lr}],
+            {"all": trainable_named},
+            [],
+        )
+
+    grouped_named = {"base_llm": [], "projection_mlp": [], "other": []}
+    for name, param in trainable_named:
+        if "kge_projector" in name or "kge_residual_norm" in name:
+            grouped_named["projection_mlp"].append((name, param))
+        elif "base_causallm" in name:
+            grouped_named["base_llm"].append((name, param))
+        else:
+            grouped_named["other"].append((name, param))
+
+    seen_param_ids = set()
+    for group_items in grouped_named.values():
+        for _, param in group_items:
+            param_id = id(param)
+            if param_id in seen_param_ids:
+                raise RuntimeError("Parameter was assigned to multiple optimizer groups")
+            seen_param_ids.add(param_id)
+
+    grouped_lr = {
+        "base_llm": base_lr,
+        "projection_mlp": projection_lr,
+        "other": default_lr,
+    }
+    optimizer_groups = []
+    optimizer_named_params = {}
+    for group_name in ("base_llm", "projection_mlp", "other"):
+        named_items = grouped_named[group_name]
+        if len(named_items) == 0:
+            continue
+        optimizer_groups.append(
+            {
+                "name": group_name,
+                "params": [param for _, param in named_items],
+                "lr": grouped_lr[group_name],
+            }
+        )
+        optimizer_named_params[group_name] = named_items
+
+    missing_overrides = []
+    if lr_base_llm is not None and len(grouped_named["base_llm"]) == 0:
+        missing_overrides.append("base_llm")
+    if lr_projection_mlp is not None and len(grouped_named["projection_mlp"]) == 0:
+        missing_overrides.append("projection_mlp")
+
+    return optimizer_groups, optimizer_named_params, missing_overrides
+
+
+def _group_grad_norm(parameters, device):
+    total = None
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        grad = parameter.grad.detach().float()
+        grad_sq = grad.pow(2).sum()
+        total = grad_sq if total is None else total + grad_sq
+    if total is None:
+        return None
+    return total.sqrt().to(device=device)
+
+
+def _group_param_norm(parameters, device):
+    total = None
+    for parameter in parameters:
+        param_sq = parameter.detach().float().pow(2).sum()
+        total = param_sq if total is None else total + param_sq
+    if total is None:
+        return torch.tensor(0.0, device=device)
+    return total.sqrt().to(device=device)
+
+
 def _optimizer_update_steps(num_batches: int, gradient_accumulation_steps: int) -> int:
     if gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be > 0")
@@ -169,6 +279,8 @@ def main():
         "lr_scheduler": "none",
         "lr_warmup_ratio": 0.0,
         "max_grad_norm": None,
+        "lr_base_llm": None,
+        "lr_projection_mlp": None,
     }
     for key, value in default_train_stability_config.items():
         if not hasattr(configs, key):
@@ -377,6 +489,8 @@ def main():
     if not configs.debug and not configs.only_eval and rank == 0:
         wandb_run = wandb.init(project=configs.project, name=configs.name, id=configs.id if configs.id else None, resume="allow")
         wandb_run.config.update(configs, allow_val_change=True)
+        wandb_run.define_metric("train/step")
+        wandb_run.define_metric("train/*", step_metric="train/step")
         text_table = wandb.Table(columns=["step", "text"])
 
     else:
@@ -385,6 +499,8 @@ def main():
     optimizer = None
     scheduler = None
     optimizer_stage = None
+    optimizer_group_names = []
+    optimizer_group_parameters = {}
 
     best_acc = 0
 
@@ -464,18 +580,31 @@ def main():
                 configs.reset_optimizer and optimizer_stage != scheduled_stage
             )
             if should_reset_optimizer:
-                trainable = _trainable_parameters(parallel_model)
-                if len(trainable) == 0:
-                    raise RuntimeError(
-                        "No trainable parameters found for optimizer initialization"
-                    )
-                optimizer = optim.AdamW(
-                    trainable,
+                optimizer_groups, optimizer_named_params, missing_overrides = _build_optimizer_param_groups(
+                    parallel_model,
                     lr=configs.lr,
+                    lr_base_llm=getattr(configs, "lr_base_llm", None),
+                    lr_projection_mlp=getattr(configs, "lr_projection_mlp", None),
+                )
+                optimizer = optim.AdamW(
+                    [
+                        {"params": group["params"], "lr": group["lr"]}
+                        for group in optimizer_groups
+                    ],
                     weight_decay=configs.weight_decay,
                 )
                 optimizer_stage = scheduled_stage
                 scheduler = None
+                optimizer_group_names = [group["name"] for group in optimizer_groups]
+                optimizer_group_parameters = {
+                    group_name: [param for _, param in named_params]
+                    for group_name, named_params in optimizer_named_params.items()
+                }
+                if rank == 0 and len(missing_overrides) > 0:
+                    print(
+                        "Warning: split LR override requested but no matching trainable parameters for groups:",
+                        missing_overrides,
+                    )
 
                 scheduler_name = str(getattr(configs, "lr_scheduler", "none")).lower()
                 if scheduler_name not in {"none", "cosine"}:
@@ -555,6 +684,8 @@ def main():
                 loss.backward()
 
                 grad_norm_to_log = None
+                group_grad_norms_to_log = {}
+                group_param_norms_to_log = {}
                 if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
                     train_dataloader
                 ) - 1:
@@ -570,6 +701,15 @@ def main():
                             grad_norm_to_log = grad_norm.detach().float()
                         else:
                             grad_norm_to_log = torch.tensor(float(grad_norm), device=device)
+
+                    for group_name in optimizer_group_names:
+                        group_parameters = optimizer_group_parameters.get(group_name, [])
+                        group_grad_norm = _group_grad_norm(group_parameters, device=device)
+                        if group_grad_norm is not None:
+                            group_grad_norms_to_log[group_name] = group_grad_norm
+                        group_param_norms_to_log[group_name] = _group_param_norm(
+                            group_parameters, device=device
+                        )
 
                     optimizer.step()
                     if scheduler is not None:
@@ -593,9 +733,21 @@ def main():
                     if getattr(outputs, "anchor_coverage", None) is not None:
                         log_dict["train/anchor_coverage"] = outputs.anchor_coverage.detach().float()
                     if optimizer is not None:
-                        log_dict["train/lr"] = optimizer.param_groups[0]["lr"]
+                        lr_by_group = {}
+                        for group_name, group in zip(optimizer_group_names, optimizer.param_groups):
+                            group_lr = group["lr"]
+                            lr_by_group[group_name] = group_lr
+                            log_dict[f"train/lr/{group_name}"] = group_lr
+                        if "base_llm" in lr_by_group:
+                            log_dict["train/lr"] = lr_by_group["base_llm"]
+                        else:
+                            log_dict["train/lr"] = optimizer.param_groups[0]["lr"]
                     if grad_norm_to_log is not None:
                         log_dict["train/grad_norm"] = grad_norm_to_log
+                    for group_name, grad_norm in group_grad_norms_to_log.items():
+                        log_dict[f"train/grad_norm/{group_name}"] = grad_norm
+                    for group_name, param_norm in group_param_norms_to_log.items():
+                        log_dict[f"train/param_norm/{group_name}"] = param_norm
                     wandb_run.log(log_dict)
 
                 pbar.set_description(

@@ -139,6 +139,8 @@ The configuration of a run should be specified in a yaml file (an example can be
   - **gradient_accumulation_steps**: Gradient accumulation steps
   - **num_epochs**: Maximum training epoches.
   - **lr**: Learning rate
+  - **lr_base_llm**: Optional override for base LLM learning rate (`base_causallm.*`). Falls back to `lr`.
+  - **lr_projection_mlp**: Optional override for projector learning rate (`kge_projector.*` and `kge_residual_norm.*`). Falls back to `lr`.
   - **weight_decay**: Weight decay
   - **lr_scheduler**: Learning rate scheduler (`none`, `cosine`).
   - **lr_warmup_ratio**: Warmup fraction of optimizer-update steps (e.g. `0.1` for 10%).
