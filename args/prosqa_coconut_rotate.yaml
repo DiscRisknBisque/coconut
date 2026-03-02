@@ -53,3 +53,4 @@ freeze_base_llm: True
 lr_scheduler: cosine
 lr_warmup_ratio: 0.1
 max_grad_norm: 1.0
+wandb_log_training_data: False

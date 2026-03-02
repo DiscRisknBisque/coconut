@@ -281,6 +281,10 @@ def main():
         "max_grad_norm": None,
         "lr_base_llm": None,
         "lr_projection_mlp": None,
+        "wandb_log_training_data": True,
+        "wandb_training_data_max_examples": 2,
+        "wandb_training_data_max_tokens_per_example": 256,
+        "wandb_training_data_max_chars": 20000,
     }
     for key, value in default_train_stability_config.items():
         if not hasattr(configs, key):
@@ -448,6 +452,7 @@ def main():
             )
     else:
         parallel_model = DDP(model)
+    use_pin_memory = torch.cuda.is_available()
 
     del model
 
@@ -528,7 +533,7 @@ def main():
         valid_gen_dataloader = torch.utils.data.DataLoader(
             dataset_gen_val,
             num_workers=1,
-            pin_memory=True,
+            pin_memory=use_pin_memory,
             batch_size=1,
             collate_fn=collator,
             sampler=DistributedSampler(dataset_gen_val, shuffle=False),
@@ -550,7 +555,7 @@ def main():
                 dataset_train,
                 num_workers=1,
                 shuffle=False,
-                pin_memory=True,
+                pin_memory=use_pin_memory,
                 batch_size=configs.batch_size_training,
                 collate_fn=collator,
                 sampler=DistributedSampler(dataset_train, shuffle=True),
@@ -570,7 +575,7 @@ def main():
                 dataset_loss_val,
                 num_workers=1,
                 shuffle=False,
-                pin_memory=True,
+                pin_memory=use_pin_memory,
                 batch_size=configs.batch_size_training,
                 collate_fn=collator,
                 sampler=DistributedSampler(dataset_loss_val, shuffle=False),
@@ -600,10 +605,20 @@ def main():
                     group_name: [param for _, param in named_params]
                     for group_name, named_params in optimizer_named_params.items()
                 }
-                if rank == 0 and len(missing_overrides) > 0:
+                expected_missing = set()
+                if bool(getattr(configs, "freeze_base_llm", False)):
+                    expected_missing.add("base_llm")
+                if not bool(getattr(configs, "use_kge", False)):
+                    expected_missing.add("projection_mlp")
+                actionable_missing = [
+                    group_name
+                    for group_name in missing_overrides
+                    if group_name not in expected_missing
+                ]
+                if rank == 0 and len(actionable_missing) > 0:
                     print(
                         "Warning: split LR override requested but no matching trainable parameters for groups:",
-                        missing_overrides,
+                        actionable_missing,
                     )
 
                 scheduler_name = str(getattr(configs, "lr_scheduler", "none")).lower()
@@ -656,22 +671,60 @@ def main():
 
             for step, batch in enumerate(train_dataloader):
                 if step == 0 and wandb_run and rank == 0:
-                    print("logging training data")
-                    cur_bs = len(batch["input_ids"])
-                    text_str = ""
-                    for data_idx in range(cur_bs):
-                        for token_idx in range(len(batch["input_ids"][data_idx])):
-                            text_str += (
-                                str(batch["input_ids"][data_idx][token_idx].item())
-                                + " "
-                                + str(batch["labels"][data_idx][token_idx].item())
-                                + " "
-                                + tokenizer.decode(batch["input_ids"][data_idx][token_idx])
-                                + "\n"
+                    if bool(getattr(configs, "wandb_log_training_data", True)):
+                        print("logging training data")
+                        cur_bs = len(batch["input_ids"])
+                        max_examples = max(
+                            int(getattr(configs, "wandb_training_data_max_examples", 2)),
+                            0,
+                        )
+                        max_tokens_per_example = max(
+                            int(
+                                getattr(
+                                    configs,
+                                    "wandb_training_data_max_tokens_per_example",
+                                    256,
+                                )
+                            ),
+                            0,
+                        )
+                        max_chars = max(
+                            int(getattr(configs, "wandb_training_data_max_chars", 20000)),
+                            256,
+                        )
+                        text_lines = []
+                        char_count = 0
+                        truncated = False
+                        for data_idx in range(min(cur_bs, max_examples)):
+                            token_cap = min(
+                                len(batch["input_ids"][data_idx]), max_tokens_per_example
                             )
-                        text_str += "====" * 10 + "\n"
-                    text_table.add_data(total_train_steps, text_str)
-                    wandb_run.log({"data_table": text_table})
+                            for token_idx in range(token_cap):
+                                line = (
+                                    str(batch["input_ids"][data_idx][token_idx].item())
+                                    + " "
+                                    + str(batch["labels"][data_idx][token_idx].item())
+                                    + " "
+                                    + tokenizer.decode(batch["input_ids"][data_idx][token_idx])
+                                )
+                                line_len = len(line) + 1
+                                if char_count + line_len > max_chars:
+                                    truncated = True
+                                    break
+                                text_lines.append(line)
+                                char_count += line_len
+                            if truncated:
+                                break
+                            separator = "====" * 10
+                            if char_count + len(separator) + 1 > max_chars:
+                                truncated = True
+                                break
+                            text_lines.append(separator)
+                            char_count += len(separator) + 1
+                        if truncated:
+                            text_lines.append("[truncated]")
+                        text_table.add_data(total_train_steps, "\n".join(text_lines))
+                        wandb_run.log({"data_table": text_table})
 
                 total_train_steps += 1
                 batch = {

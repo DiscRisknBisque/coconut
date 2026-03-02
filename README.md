@@ -145,6 +145,10 @@ The configuration of a run should be specified in a yaml file (an example can be
   - **lr_scheduler**: Learning rate scheduler (`none`, `cosine`).
   - **lr_warmup_ratio**: Warmup fraction of optimizer-update steps (e.g. `0.1` for 10%).
   - **max_grad_norm**: Gradient clipping max norm. Disabled when unset/`None`/`<= 0`.
+  - **wandb_log_training_data**: Whether to log an example training batch text table to W&B on the first step of each epoch.
+  - **wandb_training_data_max_examples**: Max number of batch examples included in that W&B training-data table.
+  - **wandb_training_data_max_tokens_per_example**: Max tokens logged per example in that table.
+  - **wandb_training_data_max_chars**: Hard character cap for the training-data table payload sent to W&B.
 
 - **KGE settings**
   - **use_kge**: Enable RotatE-conditioned Coconut path.
