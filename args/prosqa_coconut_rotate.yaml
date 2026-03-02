@@ -53,4 +53,7 @@ freeze_base_llm: True
 lr_scheduler: cosine
 lr_warmup_ratio: 0.1
 max_grad_norm: 1.0
+wandb_log_group_grad_norm: False
+wandb_log_group_param_norm: False
+wandb_group_norm_log_interval: 50
 wandb_log_training_data: False

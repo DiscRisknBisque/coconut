@@ -145,6 +145,9 @@ The configuration of a run should be specified in a yaml file (an example can be
   - **lr_scheduler**: Learning rate scheduler (`none`, `cosine`).
   - **lr_warmup_ratio**: Warmup fraction of optimizer-update steps (e.g. `0.1` for 10%).
   - **max_grad_norm**: Gradient clipping max norm. Disabled when unset/`None`/`<= 0`.
+  - **wandb_log_group_grad_norm**: Whether to log per-group grad norms (`train/grad_norm/<group>`). Can add overhead on large models.
+  - **wandb_log_group_param_norm**: Whether to log per-group parameter norms (`train/param_norm/<group>`). This is the most expensive optional metric.
+  - **wandb_group_norm_log_interval**: Optimizer-update interval for optional per-group norm logging.
   - **wandb_log_training_data**: Whether to log an example training batch text table to W&B on the first step of each epoch.
   - **wandb_training_data_max_examples**: Max number of batch examples included in that W&B training-data table.
   - **wandb_training_data_max_tokens_per_example**: Max tokens logged per example in that table.

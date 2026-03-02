@@ -281,6 +281,9 @@ def main():
         "max_grad_norm": None,
         "lr_base_llm": None,
         "lr_projection_mlp": None,
+        "wandb_log_group_grad_norm": False,
+        "wandb_log_group_param_norm": False,
+        "wandb_group_norm_log_interval": 50,
         "wandb_log_training_data": True,
         "wandb_training_data_max_examples": 2,
         "wandb_training_data_max_tokens_per_example": 256,
@@ -658,16 +661,15 @@ def main():
 
             parallel_model.module.train()
 
-            updates_per_epoch = _optimizer_update_steps(
-                len(train_dataloader), configs.gradient_accumulation_steps
-            )
-            total_length = max(updates_per_epoch, 1)
+            total_length = max(len(train_dataloader), 1)
             pbar = tqdm(
                 colour="blue",
                 desc=f"Training Epoch: {epoch+1}",
                 total=total_length,
                 dynamic_ncols=True,
+                disable=rank != 0,
             )
+            optimizer_update_idx = 0
 
             for step, batch in enumerate(train_dataloader):
                 if step == 0 and wandb_run and rank == 0:
@@ -755,20 +757,31 @@ def main():
                         else:
                             grad_norm_to_log = torch.tensor(float(grad_norm), device=device)
 
-                    for group_name in optimizer_group_names:
-                        group_parameters = optimizer_group_parameters.get(group_name, [])
-                        group_grad_norm = _group_grad_norm(group_parameters, device=device)
-                        if group_grad_norm is not None:
-                            group_grad_norms_to_log[group_name] = group_grad_norm
-                        group_param_norms_to_log[group_name] = _group_param_norm(
-                            group_parameters, device=device
-                        )
+                    norm_log_interval = max(
+                        int(getattr(configs, "wandb_group_norm_log_interval", 50)), 1
+                    )
+                    should_log_group_norms = (
+                        optimizer_update_idx % norm_log_interval == 0
+                    )
+                    if should_log_group_norms:
+                        if bool(getattr(configs, "wandb_log_group_grad_norm", False)):
+                            for group_name in optimizer_group_names:
+                                group_parameters = optimizer_group_parameters.get(group_name, [])
+                                group_grad_norm = _group_grad_norm(group_parameters, device=device)
+                                if group_grad_norm is not None:
+                                    group_grad_norms_to_log[group_name] = group_grad_norm
+                        if bool(getattr(configs, "wandb_log_group_param_norm", False)):
+                            for group_name in optimizer_group_names:
+                                group_parameters = optimizer_group_parameters.get(group_name, [])
+                                group_param_norms_to_log[group_name] = _group_param_norm(
+                                    group_parameters, device=device
+                                )
 
                     optimizer.step()
                     if scheduler is not None:
                         scheduler.step()
                     optimizer.zero_grad()
-                    pbar.update(1)
+                    optimizer_update_idx += 1
 
                 if wandb_run and rank == 0:
                     log_dict = {
@@ -802,6 +815,7 @@ def main():
                     for group_name, param_norm in group_param_norms_to_log.items():
                         log_dict[f"train/param_norm/{group_name}"] = param_norm
                     wandb_run.log(log_dict)
+                pbar.update(1)
 
                 pbar.set_description(
                     f"Training Epoch: {epoch+1}/{configs.num_epochs}, batch {step}/{len(train_dataloader)} "
