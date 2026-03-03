@@ -44,9 +44,9 @@ class Coconut(nn.Module):
         self.latent_injection = "none"
 
         if isinstance(self.base_causallm, GPT2LMHeadModel):
-            self.embedding = self.base_causallm.transformer.get_input_embeddings()
+            object.__setattr__(self, "embedding", self.base_causallm.transformer.get_input_embeddings())
         else:
-            self.embedding = self.base_causallm.get_input_embeddings()
+            object.__setattr__(self, "embedding", self.base_causallm.get_input_embeddings())
 
         if kge_config and kge_config.get("use_kge", False):
             self._init_kge_modules(kge_config)
@@ -393,11 +393,12 @@ class Coconut(nn.Module):
             anchor_coverage=anchor_coverage,
         )
 
-    def train(self):
-        self.base_causallm.train()
+    def train(self, mode: bool = True):
+        super().train(mode)
+        return self
 
     def eval(self):
-        self.base_causallm.eval()
+        return self.train(False)
 
     def generate(
         self,

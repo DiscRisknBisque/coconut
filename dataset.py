@@ -290,9 +290,24 @@ def get_question_latent_dataset(
             "anchor_mask": sample.get("anchor_mask"),
         }
 
-    return base_dataset_valid.map(
-        process_dataset, remove_columns=list(base_dataset_valid.features), num_proc=32
-    )
+    if torch.cuda.device_count() > 1:
+        if dist.get_rank() == 0:
+            processed_dataset = base_dataset_valid.map(
+                process_dataset,
+                remove_columns=list(base_dataset_valid.features),
+                num_proc=32,
+            )
+            processed_dataset = [processed_dataset]
+        else:
+            processed_dataset = [None]
+        dist.broadcast_object_list(processed_dataset, src=0)
+        return processed_dataset[0]
+    else:
+        return base_dataset_valid.map(
+            process_dataset,
+            remove_columns=list(base_dataset_valid.features),
+            num_proc=32,
+        )
 
 
 def get_cot_latent_dataset(

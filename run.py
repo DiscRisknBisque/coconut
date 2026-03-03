@@ -22,7 +22,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
 import torch.distributed as dist
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -232,6 +232,24 @@ def _resolve_distributed_env(local_rank: int):
     return backend, device
 
 
+def _get_transformer_wrap_policy(model):
+    """Return FSDP auto-wrap policy matching the actual base model's layer class."""
+    from transformers.models.gpt2 import GPT2LMHeadModel as _GPT2LMHeadModel
+    base = getattr(model, "base_causallm", model)
+    if isinstance(base, _GPT2LMHeadModel):
+        layer_cls = {GPT2Block}
+    else:
+        try:
+            from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+            layer_cls = {LlamaDecoderLayer}
+        except ImportError:
+            raise RuntimeError(
+                f"Unrecognised base model type {type(base)}; "
+                "add its transformer layer class to _get_transformer_wrap_policy."
+            )
+    return functools.partial(transformer_auto_wrap_policy, transformer_layer_cls=layer_cls)
+
+
 @record
 def main():
     parser = argparse.ArgumentParser(description="coconut")
@@ -431,12 +449,7 @@ def main():
     print(f"Running on rank={rank}, world_size={world_size}, device={device}")
     model = model.to(device)
 
-    llama_auto_wrap_policy = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            LlamaDecoderLayer,
-        },
-    )
+    wrap_policy = _get_transformer_wrap_policy(model)
 
     if configs.bf16:
         model.to(torch.bfloat16)
@@ -447,7 +460,7 @@ def main():
         else:
             parallel_model = FSDP(
                 model,
-                auto_wrap_policy=llama_auto_wrap_policy,
+                auto_wrap_policy=wrap_policy,
                 device_id=device,
                 # KGE mode freezes base LLM params while keeping projector params trainable.
                 # Without use_orig_params, FSDP requires uniform requires_grad within each flattened handle.
