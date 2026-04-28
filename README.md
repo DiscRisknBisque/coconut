@@ -1,4 +1,4 @@
-# Coconut
+# Trail Mix (Coconut + GNN Mix-ins)
 
 The code base is the official implementation of [Training Large Language Models to Reason in a Continuous Latent Space](https://arxiv.org/abs/2412.06769).
 
