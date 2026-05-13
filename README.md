@@ -1,6 +1,6 @@
-# Coconut
+# Trail Mix (Coconut + GNN Mix-ins)
 
-The code base is the official implementation of [Training Large Language Models to Reason in a Continuous Latent Space](https://arxiv.org/abs/2412.06769).
+The code base extends Meta’s Coconut latent-reasoning framework (described in [Training Large Language Models to Reason in a Continuous Latent Space](https://arxiv.org/abs/2412.06769)) with GNN-based graph conditioning, enabling experiments on whether explicit graph structure can improve latent-space reasoning and knowledge-graph-style question answering.
 
 ![coconut](assets/coconut.png)
 
